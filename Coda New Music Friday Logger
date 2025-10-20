@@ -1,0 +1,116 @@
+// ==UserScript==
+// @name         Coda Task Logger (Memory + Manual Export)
+// @namespace    mxm-tools
+// @version      0.8.0
+// @description  Stores Coda task logs in Tampermonkey memory and lets you download them anytime.
+// @author       Richie
+// @match        https://coda.io/d/Community-Shared*
+// @grant        GM_setClipboard
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_download
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const LOG_KEY = 'coda_task_log';
+  const LOG_FILENAME = 'CodaTaskLog.txt';
+  let cachedTaskData = null;
+
+  // ---------- Helpers ----------
+  const ts = () => {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  };
+
+  function extractRowData(row) {
+    const cells = Array.from(row.querySelectorAll('td'));
+    if (!cells.length) return null;
+    return {
+      isrc: (cells[1]?.textContent || '').trim() || 'N/A',
+      artist: (cells[2]?.textContent || '').trim() || 'N/A',
+      title: (cells[3]?.textContent || '').trim() || 'N/A',
+    };
+  }
+
+  function appendToMemory(line) {
+    const old = GM_getValue(LOG_KEY, '');
+    const newLog = old + line + '\n';
+    GM_setValue(LOG_KEY, newLog);
+  }
+
+  function downloadLog() {
+    const data = GM_getValue(LOG_KEY, '');
+    const content = data.trim() || '(no entries logged yet)';
+    GM_download({
+      url: 'data:text/plain;charset=utf-8,' + encodeURIComponent(content),
+      name: LOG_FILENAME,
+      saveAs: true,
+    });
+  }
+
+  // ---------- Core Logic ----------
+  function handleClick(e) {
+    const target = e.target;
+    if (!target) return;
+    const button = target.closest('button');
+    if (!button) return;
+
+    // Cache task info when "Take Task" is clicked
+    if (button.textContent.toLowerCase().includes('take')) {
+      // Let the DOM update fully before capturing
+      setTimeout(() => {
+        const row = button.closest('tr');
+        const data = extractRowData(row);
+        if (data) cachedTaskData = data;
+      }, 200);
+    }
+
+    // Log on "Close Task"
+    if (button.textContent.toLowerCase().includes('close')) {
+      if (!cachedTaskData) return;
+      const line = `${ts()} | ${cachedTaskData.isrc} | ${cachedTaskData.artist} | ${cachedTaskData.title}`;
+      GM_setClipboard(line);
+      appendToMemory(line);
+
+      // Feedback
+      const original = button.textContent;
+      button.textContent = '✅ Logged!';
+      button.style.backgroundColor = '#28a745';
+      setTimeout(() => {
+        button.textContent = original;
+        button.style.backgroundColor = '';
+      }, 2000);
+      cachedTaskData = null;
+    }
+  }
+
+  document.addEventListener('click', handleClick);
+
+  // ---------- UI Button ----------
+  function createDownloadButton() {
+    const btn = document.createElement('button');
+    btn.textContent = '📄 Download Log';
+    Object.assign(btn.style, {
+      position: 'fixed',
+      bottom: '20px',
+      right: '20px',
+      background: '#1a73e8',
+      color: '#fff',
+      border: 'none',
+      borderRadius: '8px',
+      padding: '10px 16px',
+      fontSize: '14px',
+      fontWeight: '600',
+      cursor: 'pointer',
+      boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
+      zIndex: 999999,
+    });
+    btn.addEventListener('click', downloadLog);
+    document.body.appendChild(btn);
+  }
+
+  window.addEventListener('load', () => setTimeout(createDownloadButton, 2000));
+})();
