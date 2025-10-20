@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Coda Task Logger (Memory + Manual Export)
 // @namespace    mxm-tools
-// @version      0.8.0
+// @version      1.0.0
 // @description  Stores Coda task logs in Tampermonkey memory and lets you download them anytime.
 // @author       Richie
 // @match        https://coda.io/d/Community-Shared*
@@ -16,7 +16,6 @@
 
   const LOG_KEY = 'coda_task_log';
   const LOG_FILENAME = 'CodaTaskLog.txt';
-  let cachedTaskData = null;
 
   // ---------- Helpers ----------
   const ts = () => {
@@ -25,13 +24,114 @@
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
   };
 
-  function extractRowData(row) {
-    const cells = Array.from(row.querySelectorAll('td'));
-    if (!cells.length) return null;
+  function normaliseWhitespace(value) {
+    return (value || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function findRowElement(element) {
+    if (!element) return null;
+    return (
+      element.closest('tr') ||
+      element.closest('[role="row"]') ||
+      element.closest('[data-row-id]') ||
+      element.closest('[data-testid="canvas-view-row"]') ||
+      null
+    );
+  }
+
+  function getRowCells(row) {
+    if (!row) return [];
+    const selectors = [
+      '[role="gridcell"]',
+      'td',
+      '[data-column-id]',
+      '[data-testid="canvas-view-cell"]',
+      '[data-testid="tableColumnCell"]',
+    ];
+
+    for (const selector of selectors) {
+      const cells = Array.from(row.querySelectorAll(selector));
+      if (cells.length) {
+        return cells;
+      }
+    }
+
+    // Fallback: use direct children
+    return Array.from(row.children || []);
+  }
+
+  function detectByLabel(cell, text) {
+    const candidate = [
+      cell?.dataset?.columnId,
+      cell?.dataset?.columnName,
+      cell?.dataset?.columnLabel,
+      cell?.getAttribute('data-column-id'),
+      cell?.getAttribute('data-column-label'),
+      cell?.getAttribute('aria-label'),
+      text,
+    ]
+      .map((value) => value || '')
+      .join(' ')
+      .toLowerCase();
+
     return {
-      isrc: (cells[1]?.textContent || '').trim() || 'N/A',
-      artist: (cells[2]?.textContent || '').trim() || 'N/A',
-      title: (cells[3]?.textContent || '').trim() || 'N/A',
+      isISRC: candidate.includes('isrc') || /\bisrc\b/.test(candidate),
+      isArtist: candidate.includes('artist'),
+      isTitle: candidate.includes('title'),
+    };
+  }
+
+  function extractRowData(row) {
+    if (!row) return null;
+
+    const cells = getRowCells(row);
+    if (!cells.length) return null;
+
+    const result = { isrc: '', artist: '', title: '' };
+
+    const cellTexts = cells.map((cell) => normaliseWhitespace(cell.innerText || cell.textContent || ''));
+
+    cells.forEach((cell, index) => {
+      const text = cellTexts[index];
+      if (!text) return;
+      const { isISRC, isArtist, isTitle } = detectByLabel(cell, text);
+      if (isISRC && !result.isrc) {
+        result.isrc = text;
+      } else if (isArtist && !result.artist) {
+        result.artist = text;
+      } else if (isTitle && !result.title) {
+        result.title = text;
+      }
+    });
+
+    const cleanedTexts = cellTexts.filter((text) => {
+      if (!text) return false;
+      if (/take\s+the\s+task/i.test(text)) return false;
+      if (/close\s+task/i.test(text)) return false;
+      if (/^\d+$/.test(text)) return false; // row index numbers
+      return true;
+    });
+
+    const isrcPattern = /[A-Z]{2}-?[A-Z0-9]{3}-?\d{2}-?\d{5}/;
+    if (!result.isrc) {
+      const isrcCandidate = cleanedTexts.find((text) => isrcPattern.test(text.toUpperCase()));
+      if (isrcCandidate) {
+        result.isrc = isrcCandidate.toUpperCase();
+      }
+    }
+
+    const remaining = cleanedTexts.filter((text) => text !== result.isrc);
+    if (!result.artist && remaining.length) {
+      result.artist = remaining[0];
+    }
+    if (!result.title && remaining.length > 1) {
+      result.title = remaining[1];
+    }
+
+    return {
+      isrc: result.isrc || 'N/A',
+      artist: result.artist || 'N/A',
+      title: result.title || 'N/A',
     };
   }
 
@@ -51,6 +151,33 @@
     });
   }
 
+  function provideFeedback(button, trigger) {
+    if (!button) return;
+    const original = button.textContent;
+    const originalBg = button.style.backgroundColor;
+    button.textContent = trigger === 'take' ? '✅ Logged!' : '✅ Log saved';
+    button.style.backgroundColor = '#28a745';
+    setTimeout(() => {
+      button.textContent = original;
+      button.style.backgroundColor = originalBg;
+    }, 2000);
+  }
+
+  function logTask(button, trigger) {
+    const row = findRowElement(button);
+    if (!row) return;
+
+    // allow DOM to settle after the click
+    setTimeout(() => {
+      const data = extractRowData(row);
+      if (!data) return;
+      const line = `${ts()} | ${data.isrc} | ${data.artist} | ${data.title}`;
+      GM_setClipboard(line);
+      appendToMemory(line);
+      provideFeedback(button, trigger);
+    }, 120);
+  }
+
   // ---------- Core Logic ----------
   function handleClick(e) {
     const target = e.target;
@@ -58,32 +185,11 @@
     const button = target.closest('button');
     if (!button) return;
 
-    // Cache task info when "Take Task" is clicked
-    if (button.textContent.toLowerCase().includes('take')) {
-      // Let the DOM update fully before capturing
-      setTimeout(() => {
-        const row = button.closest('tr');
-        const data = extractRowData(row);
-        if (data) cachedTaskData = data;
-      }, 200);
-    }
-
-    // Log on "Close Task"
-    if (button.textContent.toLowerCase().includes('close')) {
-      if (!cachedTaskData) return;
-      const line = `${ts()} | ${cachedTaskData.isrc} | ${cachedTaskData.artist} | ${cachedTaskData.title}`;
-      GM_setClipboard(line);
-      appendToMemory(line);
-
-      // Feedback
-      const original = button.textContent;
-      button.textContent = '✅ Logged!';
-      button.style.backgroundColor = '#28a745';
-      setTimeout(() => {
-        button.textContent = original;
-        button.style.backgroundColor = '';
-      }, 2000);
-      cachedTaskData = null;
+    const text = button.textContent.toLowerCase();
+    if (text.includes('take') && text.includes('task')) {
+      logTask(button, 'take');
+    } else if (text.includes('close') && text.includes('task')) {
+      logTask(button, 'close');
     }
   }
 
@@ -91,8 +197,12 @@
 
   // ---------- UI Button ----------
   function createDownloadButton() {
+    const existing = document.querySelector('[data-coda-task-logger="download"]');
+    if (existing) return;
+
     const btn = document.createElement('button');
     btn.textContent = '📄 Download Log';
+    btn.dataset.codaTaskLogger = 'download';
     Object.assign(btn.style, {
       position: 'fixed',
       bottom: '20px',
