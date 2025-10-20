@@ -153,6 +153,21 @@
 
   function provideFeedback(button, trigger) {
     if (!button) return;
+    const isNativeButton = button.tagName === 'BUTTON';
+    if (!isNativeButton) {
+      button.setAttribute('data-coda-task-logger-feedback', '1');
+      button.style.outline = '2px solid #28a745';
+      button.style.outlineOffset = '2px';
+      setTimeout(() => {
+        if (button.getAttribute('data-coda-task-logger-feedback')) {
+          button.style.outline = '';
+          button.style.outlineOffset = '';
+          button.removeAttribute('data-coda-task-logger-feedback');
+        }
+      }, 1200);
+      return;
+    }
+
     const original = button.textContent;
     const originalBg = button.style.backgroundColor;
     button.textContent = trigger === 'take' ? '✅ Logged!' : '✅ Log saved';
@@ -182,10 +197,10 @@
   function handleClick(e) {
     const target = e.target;
     if (!target) return;
-    const button = target.closest('button');
+    const button = target.closest('button, [role="button"], [data-testid="canvas-view-row-action"], [data-testid="task-action-button"]');
     if (!button) return;
 
-    const text = button.textContent.toLowerCase();
+    const text = normaliseWhitespace(button.innerText || button.textContent || '').toLowerCase();
     if (text.includes('take') && text.includes('task')) {
       logTask(button, 'take');
     } else if (text.includes('close') && text.includes('task')) {
