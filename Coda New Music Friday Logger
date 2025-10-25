@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Coda Task Logger (Memory + Manual Export)
 // @namespace    mxm-tools
-// @version      1.0.0
+// @version      1.1.0
 // @description  Stores Coda task logs in Tampermonkey memory and lets you download them anytime.
 // @author       Richie
 // @match        https://coda.io/d/Community-Shared*
@@ -16,6 +16,24 @@
 
   const LOG_KEY = 'coda_task_log';
   const LOG_FILENAME = 'CodaTaskLog.txt';
+  const DEBUG = false;
+
+  const COLUMN_KEYWORDS = {
+    isrc: ['isrc', 'isrc code', 'isrc#'],
+    artist: [
+      'artist',
+      'primary artist',
+      'main artist',
+      'performer',
+      'creator',
+      'writer',
+    ],
+    title: ['title', 'track name', 'song title', 'track', 'track title'],
+  };
+
+  function matchesKeyword(candidate, keywords) {
+    return keywords.some((keyword) => candidate.includes(keyword));
+  }
 
   // ---------- Helpers ----------
   const ts = () => {
@@ -75,9 +93,10 @@
       .toLowerCase();
 
     return {
-      isISRC: candidate.includes('isrc') || /\bisrc\b/.test(candidate),
-      isArtist: candidate.includes('artist'),
-      isTitle: candidate.includes('title'),
+      isISRC:
+        matchesKeyword(candidate, COLUMN_KEYWORDS.isrc) || /\bisrc\b/.test(candidate),
+      isArtist: matchesKeyword(candidate, COLUMN_KEYWORDS.artist),
+      isTitle: matchesKeyword(candidate, COLUMN_KEYWORDS.title),
     };
   }
 
@@ -90,6 +109,10 @@
     const result = { isrc: '', artist: '', title: '' };
 
     const cellTexts = cells.map((cell) => normaliseWhitespace(cell.innerText || cell.textContent || ''));
+
+    if (DEBUG) {
+      console.log('[Coda Logger] Found cell texts:', cellTexts);
+    }
 
     cells.forEach((cell, index) => {
       const text = cellTexts[index];
@@ -122,10 +145,28 @@
 
     const remaining = cleanedTexts.filter((text) => text !== result.isrc);
     if (!result.artist && remaining.length) {
-      result.artist = remaining[0];
+      const artistCandidate = remaining.find((text) => {
+        const cellIndex = cellTexts.indexOf(text);
+        if (cellIndex === -1) return false;
+        const { isArtist } = detectByLabel(cells[cellIndex], text);
+        return isArtist;
+      });
+      result.artist = artistCandidate || remaining[0];
     }
     if (!result.title && remaining.length > 1) {
-      result.title = remaining[1];
+      const remainingWithoutArtist = remaining.filter((text) => text !== result.artist);
+      const titleCandidate = remainingWithoutArtist.find((text) => {
+        const cellIndex = cellTexts.indexOf(text);
+        if (cellIndex === -1) return false;
+        const { isTitle } = detectByLabel(cells[cellIndex], text);
+        return isTitle;
+      });
+      result.title =
+        titleCandidate ||
+        remainingWithoutArtist[0] ||
+        remaining.find((text) => text !== result.artist) ||
+        remaining[1] ||
+        remaining[0];
     }
 
     return {
@@ -190,7 +231,7 @@
       GM_setClipboard(line);
       appendToMemory(line);
       provideFeedback(button, trigger);
-    }, 120);
+    }, 500);
   }
 
   // ---------- Core Logic ----------
