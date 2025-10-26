@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Coda Task Logger (Memory + Manual Export)
 // @namespace    mxm-tools
-// @version      1.1.0
+// @version      1.1.1
 // @description  Stores Coda task logs in Tampermonkey memory and lets you download them anytime.
 // @author       Richie
 // @match        https://coda.io/d/Community-Shared*
@@ -228,14 +228,24 @@
   }
 
   function logTask(button, trigger) {
+    console.log('[Coda Logger] logTask() called for trigger:', trigger);
     const row = findRowElement(button);
-    if (!row) return;
+    if (!row) {
+      console.error('[Coda Logger] ERROR: Could not find parent row element for the button.');
+      return;
+    }
+    console.log('[Coda Logger] Found parent row element:', row);
 
     // allow DOM to settle after the click
     setTimeout(() => {
+      console.log('[Coda Logger] setTimeout() running, calling extractRowData()');
       const data = extractRowData(row);
-      if (!data) return;
+      if (!data) {
+        console.error('[Coda Logger] ERROR: extractRowData() returned no data.');
+        return;
+      }
       const line = `${ts()} | ${data.isrc} | ${data.artist} | ${data.title}`;
+      console.log('[Coda Logger] SUCCESS: Data extracted:', line);
       GM_setClipboard(line);
       appendToMemory(line);
       provideFeedback(button, trigger);
@@ -246,13 +256,24 @@
   function handleClick(e) {
     const target = e.target;
     if (!target) return;
-    const button = target.closest('button, [role="button"], [data-testid="canvas-view-row-action"], [data-testid="task-action-button"]');
-    if (!button) return;
 
+    // console.log('[Coda Logger] Click detected. Target:', target); // <-- Optional: very noisy
+
+    const button = target.closest('button, [role="button"], [data-testid="canvas-view-row-action"], [data-testid="task-action-button"]');
+    if (!button) {
+      // This is normal, happens on every click that isn't a button
+      return;
+    }
+
+    console.log('[Coda Logger] Found a potential button:', button);
     const text = normaliseWhitespace(button.innerText || button.textContent || '').toLowerCase();
+    console.log('[Coda Logger] Button text is:', text);
+
     if (text.includes('take') && text.includes('task')) {
+      console.log('[Coda Logger] "Take task" button confirmed.');
       logTask(button, 'take');
     } else if (text.includes('close') && text.includes('task')) {
+      console.log('[Coda Logger] "Close task" button confirmed.');
       logTask(button, 'close');
     }
   }
