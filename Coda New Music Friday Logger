@@ -16,19 +16,27 @@
 
   const LOG_KEY = 'coda_task_log';
   const LOG_FILENAME = 'CodaTaskLog.txt';
-  const DEBUG = false;
+  const DEBUG = true;
 
   const COLUMN_KEYWORDS = {
     isrc: ['isrc', 'isrc code', 'isrc#'],
     artist: [
       'artist',
+      'artist name',
       'primary artist',
       'main artist',
       'performer',
       'creator',
       'writer',
     ],
-    title: ['title', 'track name', 'song title', 'track', 'track title'],
+    title: [
+      'title',
+      'title name',
+      'track name',
+      'song title',
+      'track',
+      'track title',
+    ],
   };
 
   function matchesKeyword(candidate, keywords) {
