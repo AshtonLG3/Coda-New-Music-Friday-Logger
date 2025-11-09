@@ -223,19 +223,39 @@
   }
 
   function appendToMemory(line) {
-    const old = GM_getValue(LOG_KEY, '');
-    const newLog = old + line + '\n';
-    GM_setValue(LOG_KEY, newLog);
+    try {
+      const old = typeof GM_getValue === 'function'
+        ? GM_getValue(LOG_KEY, '')
+        : localStorage.getItem(LOG_KEY) || '';
+
+      const newLog = old + line + '\n';
+
+      if (typeof GM_setValue === 'function') {
+        GM_setValue(LOG_KEY, newLog);
+        console.log('[Coda Logger] Log saved to GM storage.');
+      } else {
+        localStorage.setItem(LOG_KEY, newLog);
+        console.log('[Coda Logger] Log saved to localStorage.');
+      }
+    } catch (err) {
+      console.error('[Coda Logger] ERROR saving log:', err);
+      const fallback = localStorage.getItem(LOG_KEY) || '';
+      localStorage.setItem(LOG_KEY, fallback + line + '\n');
+    }
   }
 
   function downloadLog() {
-    const data = GM_getValue(LOG_KEY, '');
+    const data = typeof GM_getValue === 'function'
+      ? GM_getValue(LOG_KEY, localStorage.getItem(LOG_KEY) || '')
+      : localStorage.getItem(LOG_KEY) || '';
+
     const content = data.trim() || '(no entries logged yet)';
-    GM_download({
-      url: 'data:text/plain;charset=utf-8,' + encodeURIComponent(content),
-      name: LOG_FILENAME,
-      saveAs: true,
-    });
+    const blob = new Blob([content], { type: 'text/plain' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = LOG_FILENAME;
+    link.click();
+    URL.revokeObjectURL(link.href);
   }
 
   function provideFeedback(button, trigger) {
