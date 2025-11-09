@@ -17,6 +17,8 @@
   const LOG_KEY = 'coda_task_log';
   const LOG_FILENAME = 'CodaTaskLog.txt';
   const DEBUG = true;
+  const STABILITY_CHECKS = 12;
+  const STABILITY_INTERVAL = 150;
 
   const COLUMN_KEYWORDS = {
     isrc: ['isrc', 'isrc code', 'isrc#'],
@@ -184,6 +186,42 @@
     };
   }
 
+  function waitForStableRow(
+    row,
+    attempts = STABILITY_CHECKS,
+    intervalMs = STABILITY_INTERVAL
+  ) {
+    return new Promise((resolve) => {
+      if (!row) {
+        resolve(null);
+        return;
+      }
+
+      const totalAttempts = attempts;
+      const interval = setInterval(() => {
+        if (!row.isConnected) {
+          clearInterval(interval);
+          resolve(null);
+          return;
+        }
+
+        const data = extractRowData(row);
+        const isReady = data && data.isrc && data.isrc !== 'N/A';
+
+        if (isReady) {
+          clearInterval(interval);
+          console.log(
+            `[Coda Logger] Row stabilized after ${totalAttempts - attempts + 1} checks.`
+          );
+          resolve(data);
+        } else if (--attempts <= 0) {
+          clearInterval(interval);
+          resolve(data || null);
+        }
+      }, intervalMs);
+    });
+  }
+
   function appendToMemory(line) {
     const old = GM_getValue(LOG_KEY, '');
     const newLog = old + line + '\n';
@@ -236,20 +274,22 @@
     }
     console.log('[Coda Logger] Found parent row element:', row);
 
-    // allow DOM to settle after the click
-    setTimeout(() => {
-      console.log('[Coda Logger] setTimeout() running, calling extractRowData()');
-      const data = extractRowData(row);
+    waitForStableRow(row).then((data) => {
       if (!data) {
-        console.error('[Coda Logger] ERROR: extractRowData() returned no data.');
+        console.error('[Coda Logger] ERROR: Failed to extract row data after waiting for stability.');
         return;
       }
+
+      if (data.isrc === 'N/A') {
+        console.warn('[Coda Logger] WARNING: Row data stabilized but ISRC is still missing.');
+      }
+
       const line = `${ts()} | ${data.isrc} | ${data.artist} | ${data.title}`;
       console.log('[Coda Logger] SUCCESS: Data extracted:', line);
       GM_setClipboard(line);
       appendToMemory(line);
       provideFeedback(button, trigger);
-    }, 500);
+    });
   }
 
   // ---------- Core Logic ----------
