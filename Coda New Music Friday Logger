@@ -1,10 +1,13 @@
 // ==UserScript==
 // @name         Coda Task Logger (Memory + Manual Export)
 // @namespace    mxm-tools
-// @version      1.1.1
+// @version      1.2.0
 // @description  Stores Coda task logs in Tampermonkey memory and lets you download them anytime.
 // @author       Richie
-// @match        https://coda.io/d/Community-Shared*
+// @match        https://coda.io/*
+// @run-at       document-end
+// @noframes     false
+// @grant        unsafeWindow
 // @grant        GM_setClipboard
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -19,6 +22,13 @@
   const DEBUG = true;
   const STABILITY_CHECKS = 12;
   const STABILITY_INTERVAL = 150;
+  const FRAME_REATTACH_INTERVAL = 3000;
+  const ELEMENT_NODE = typeof Node !== 'undefined' ? Node.ELEMENT_NODE : 1;
+
+  const attachedDocuments = new WeakSet();
+  const observedDocuments = new WeakMap();
+  const processedIframes = new WeakSet();
+  const hostWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
   const COLUMN_KEYWORDS = {
     isrc: ['isrc', 'isrc code', 'isrc#'],
@@ -54,6 +64,123 @@
 
   function normaliseWhitespace(value) {
     return (value || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function isTopLevelContext() {
+    try {
+      return hostWindow.top === hostWindow.self;
+    } catch (err) {
+      return window.top === window.self;
+    }
+  }
+
+  function attachClickListener(targetDoc, label = 'document') {
+    if (!targetDoc || attachedDocuments.has(targetDoc)) {
+      return;
+    }
+
+    targetDoc.addEventListener('click', handleClick, true);
+    attachedDocuments.add(targetDoc);
+
+    if (DEBUG) {
+      console.log(`[Coda Logger] Attached click listener to ${label}.`);
+    }
+  }
+
+  function observeDocumentForIframes(targetDoc) {
+    if (!targetDoc || observedDocuments.has(targetDoc)) {
+      return;
+    }
+
+    const observer = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes || []) {
+          if (!node || node.nodeType !== ELEMENT_NODE) {
+            continue;
+          }
+
+          if (node.tagName === 'IFRAME') {
+            registerIframe(node);
+          }
+
+          const nestedIframes = node.querySelectorAll?.('iframe');
+          if (nestedIframes && nestedIframes.length) {
+            nestedIframes.forEach(registerIframe);
+          }
+        }
+      }
+    });
+
+    observer.observe(targetDoc, { childList: true, subtree: true });
+    observedDocuments.set(targetDoc, observer);
+  }
+
+  function isCodaIframe(iframe) {
+    if (!iframe) return false;
+
+    const src = iframe.getAttribute('src') || '';
+    const id = iframe.id || '';
+    const className = typeof iframe.className === 'string' ? iframe.className : '';
+    const dataTestId = iframe.getAttribute('data-testid') || '';
+
+    return (
+      /coda\.io/i.test(src) ||
+      /EmbedIframe/i.test(id) ||
+      /FullPageEmbedIframe/i.test(id) ||
+      /EmbedIframe/i.test(className) ||
+      /FullPageEmbedIframe/i.test(className) ||
+      /EmbedIframe/i.test(dataTestId) ||
+      /FullPageEmbedIframe/i.test(dataTestId)
+    );
+  }
+
+  function registerIframe(iframe) {
+    if (!iframe || processedIframes.has(iframe) || !isCodaIframe(iframe)) {
+      return;
+    }
+
+    processedIframes.add(iframe);
+
+    const attach = () => {
+      try {
+        const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
+        if (!iframeDoc) {
+          return;
+        }
+
+        attachClickListener(iframeDoc, 'iframe document');
+        observeDocumentForIframes(iframeDoc);
+      } catch (err) {
+        console.error('[Coda Logger] Iframe access error:', err);
+      }
+    };
+
+    attach();
+    iframe.addEventListener('load', attach);
+  }
+
+  function attachToIframes(rootDoc = document) {
+    if (!rootDoc) return;
+
+    const iframes = rootDoc.querySelectorAll?.('iframe');
+    if (!iframes || !iframes.length) {
+      return;
+    }
+
+    iframes.forEach(registerIframe);
+  }
+
+  function initializeFrameBridging() {
+    const label = isTopLevelContext() ? 'top document' : 'embedded document';
+    attachClickListener(document, label);
+    observeDocumentForIframes(document);
+    attachToIframes(document);
+
+    if (!hostWindow.__codaTaskLoggerFrameTimer) {
+      hostWindow.__codaTaskLoggerFrameTimer = hostWindow.setInterval(() => {
+        attachToIframes(document);
+      }, FRAME_REATTACH_INTERVAL);
+    }
   }
 
   function findRowElement(element) {
@@ -338,10 +465,12 @@
     }
   }
 
-  document.addEventListener('click', handleClick);
-
   // ---------- UI Button ----------
   function createDownloadButton() {
+    if (!isTopLevelContext()) {
+      return;
+    }
+
     const existing = document.querySelector('[data-coda-task-logger="download"]');
     if (existing) return;
 
@@ -367,5 +496,25 @@
     document.body.appendChild(btn);
   }
 
-  window.addEventListener('load', () => setTimeout(createDownloadButton, 2000));
+  function startLogger() {
+    initializeFrameBridging();
+
+    if (isTopLevelContext()) {
+      setTimeout(createDownloadButton, 2000);
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', startLogger);
+  } else {
+    startLogger();
+  }
+
+  window.addEventListener('load', () => {
+    initializeFrameBridging();
+
+    if (isTopLevelContext()) {
+      createDownloadButton();
+    }
+  });
 })();
