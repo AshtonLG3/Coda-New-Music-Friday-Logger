@@ -17,8 +17,9 @@
 (function () {
   'use strict';
 
-  const LOG_KEY = 'coda_task_log';
-  const LOG_FILENAME = 'CodaTaskLog.txt';
+  const LOG_KEY_PREFIX = 'coda_task_log::';
+  const WINDOW_STATE_KEY = 'coda_task_log_window_state';
+  const DEFAULT_FILE_EXTENSION = '.json';
   const DEBUG = true;
   const STABILITY_CHECKS = 12;
   const STABILITY_INTERVAL = 150;
@@ -56,11 +57,126 @@
   }
 
   // ---------- Helpers ----------
-  const ts = () => {
-    const d = new Date();
+  const ts = (date = new Date()) => {
+    const d = date instanceof Date ? date : new Date(date);
     const p = (n) => String(n).padStart(2, '0');
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
   };
+
+  function readStorage(key, fallback = '') {
+    try {
+      if (typeof GM_getValue === 'function') {
+        return GM_getValue(key, fallback);
+      }
+    } catch (err) {
+      console.warn('[Coda Logger] GM_getValue failed, falling back to localStorage.', err);
+    }
+
+    try {
+      const value = localStorage.getItem(key);
+      return value === null ? fallback : value;
+    } catch (err) {
+      console.error('[Coda Logger] Failed to read from localStorage:', err);
+      return fallback;
+    }
+  }
+
+  function writeStorage(key, value) {
+    try {
+      if (typeof GM_setValue === 'function') {
+        GM_setValue(key, value);
+        return;
+      }
+    } catch (err) {
+      console.warn('[Coda Logger] GM_setValue failed, falling back to localStorage.', err);
+    }
+
+    try {
+      localStorage.setItem(key, value);
+    } catch (err) {
+      console.error('[Coda Logger] Failed to write to localStorage:', err);
+    }
+  }
+
+  function getCurrentNMFWindow(referenceDate = new Date()) {
+    const now = referenceDate instanceof Date ? new Date(referenceDate.getTime()) : new Date(referenceDate);
+    const day = now.getDay();
+
+    const currentThursday = new Date(now);
+    currentThursday.setDate(now.getDate() - ((day + 7 - 4) % 7));
+    currentThursday.setHours(15, 0, 0, 0);
+
+    if (now < currentThursday) {
+      currentThursday.setDate(currentThursday.getDate() - 7);
+    }
+
+    const nextThursday = new Date(currentThursday);
+    nextThursday.setDate(nextThursday.getDate() + 7);
+    nextThursday.setHours(15, 0, 0, 0);
+
+    return { start: currentThursday, end: nextThursday };
+  }
+
+  function getNMFFileName(referenceDate = new Date()) {
+    const { start } = getCurrentNMFWindow(referenceDate);
+    const friday = new Date(start);
+    friday.setDate(start.getDate() + 1);
+
+    const day = String(friday.getDate()).padStart(2, '0');
+    const monthFormatter = new Intl.DateTimeFormat('en-US', { month: 'short' });
+    const month = monthFormatter.format(friday);
+
+    return `NMF-${day}${month}`;
+  }
+
+  function getActiveLogContext(referenceDate = new Date()) {
+    const { start, end } = getCurrentNMFWindow(referenceDate);
+    const fileName = getNMFFileName(referenceDate);
+    const logKey = `${LOG_KEY_PREFIX}${fileName}`;
+
+    const payload = {
+      start: start.toISOString(),
+      end: end.toISOString(),
+      fileName,
+      logKey,
+    };
+
+    try {
+      const cachedRaw = readStorage(WINDOW_STATE_KEY, '');
+      if (!cachedRaw) {
+        writeStorage(WINDOW_STATE_KEY, JSON.stringify(payload));
+      } else {
+        try {
+          const cached = JSON.parse(cachedRaw);
+          if (
+            cached?.logKey !== payload.logKey ||
+            cached?.start !== payload.start ||
+            cached?.end !== payload.end ||
+            cached?.fileName !== payload.fileName
+          ) {
+            writeStorage(WINDOW_STATE_KEY, JSON.stringify(payload));
+          }
+        } catch (err) {
+          console.warn('[Coda Logger] Failed to parse cached window state. Resetting.', err);
+          writeStorage(WINDOW_STATE_KEY, JSON.stringify(payload));
+        }
+      }
+    } catch (err) {
+      console.warn('[Coda Logger] Unable to persist window state:', err);
+    }
+
+    return {
+      start,
+      end,
+      fileName,
+      logKey,
+    };
+  }
+
+  function getActiveLogFile(referenceDate = new Date()) {
+    const { fileName } = getActiveLogContext(referenceDate);
+    return `${fileName}${DEFAULT_FILE_EXTENSION}`;
+  }
 
   function normaliseWhitespace(value) {
     return (value || '').replace(/\s+/g, ' ').trim();
@@ -349,38 +465,65 @@
     });
   }
 
-  function appendToMemory(line) {
+  function appendToMemory(entry, referenceDate = new Date()) {
     try {
-      const old = typeof GM_getValue === 'function'
-        ? GM_getValue(LOG_KEY, '')
-        : localStorage.getItem(LOG_KEY) || '';
+      const context = getActiveLogContext(referenceDate);
+      const raw = readStorage(context.logKey, '[]');
+      let logEntries = [];
 
-      const newLog = old + line + '\n';
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            logEntries = parsed;
+          }
+        } catch (err) {
+          console.warn('[Coda Logger] Existing log data was not valid JSON. Resetting.', err);
+        }
+      }
 
-      if (typeof GM_setValue === 'function') {
-        GM_setValue(LOG_KEY, newLog);
-        console.log('[Coda Logger] Log saved to GM storage.');
-      } else {
-        localStorage.setItem(LOG_KEY, newLog);
-        console.log('[Coda Logger] Log saved to localStorage.');
+      logEntries.push(entry);
+      writeStorage(context.logKey, JSON.stringify(logEntries));
+
+      if (DEBUG) {
+        console.log('[Coda Logger] Log entry stored.', {
+          file: getActiveLogFile(referenceDate),
+          windowStart: context.start,
+          windowEnd: context.end,
+          entry,
+        });
       }
     } catch (err) {
       console.error('[Coda Logger] ERROR saving log:', err);
-      const fallback = localStorage.getItem(LOG_KEY) || '';
-      localStorage.setItem(LOG_KEY, fallback + line + '\n');
     }
   }
 
   function downloadLog() {
-    const data = typeof GM_getValue === 'function'
-      ? GM_getValue(LOG_KEY, localStorage.getItem(LOG_KEY) || '')
-      : localStorage.getItem(LOG_KEY) || '';
+    const context = getActiveLogContext();
+    const raw = readStorage(context.logKey, '[]');
 
-    const content = data.trim() || '(no entries logged yet)';
-    const blob = new Blob([content], { type: 'text/plain' });
+    let content = raw;
+    let mimeType = 'application/json';
+    let downloadName = getActiveLogFile();
+
+    try {
+      const parsed = JSON.parse(raw);
+      content = JSON.stringify(parsed, null, 2);
+    } catch (err) {
+      const fallback = (raw || '').toString().trim();
+      if (!fallback) {
+        content = '(no entries logged yet)';
+      } else {
+        content = fallback;
+      }
+      mimeType = 'text/plain';
+      downloadName = `${context.fileName}.txt`;
+    }
+
+    const blob = new Blob([content], { type: mimeType });
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
-    link.download = LOG_FILENAME;
+    link.download = downloadName;
     link.click();
     URL.revokeObjectURL(link.href);
   }
@@ -431,10 +574,19 @@
         console.warn('[Coda Logger] WARNING: Row data stabilized but ISRC is still missing.');
       }
 
-      const line = `${ts()} | ${data.isrc} | ${data.artist} | ${data.title}`;
+      const now = new Date();
+      const line = `${ts(now)} | ${data.isrc} | ${data.artist} | ${data.title}`;
       console.log('[Coda Logger] SUCCESS: Data extracted:', line);
       GM_setClipboard(line);
-      appendToMemory(line);
+      appendToMemory(
+        {
+          timestamp: now.toISOString(),
+          isrc: data.isrc,
+          artist: data.artist,
+          title: data.title,
+        },
+        now
+      );
       provideFeedback(button, trigger);
     });
   }
