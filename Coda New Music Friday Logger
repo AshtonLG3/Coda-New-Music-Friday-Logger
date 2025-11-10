@@ -502,28 +502,26 @@
     const context = getActiveLogContext();
     const raw = readStorage(context.logKey, '[]');
 
-    let content = raw;
-    let mimeType = 'application/json';
-    let downloadName = getActiveLogFile();
-
+    let logLines = [];
     try {
       const parsed = JSON.parse(raw);
-      content = JSON.stringify(parsed, null, 2);
-    } catch (err) {
-      const fallback = (raw || '').toString().trim();
-      if (!fallback) {
-        content = '(no entries logged yet)';
-      } else {
-        content = fallback;
+      if (Array.isArray(parsed)) {
+        logLines = parsed.map(entry => {
+          const date = new Date(entry.timestamp);
+          const pad = n => String(n).padStart(2, '0');
+          const stamp = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+          return `${stamp} | ${entry.isrc} | ${entry.artist} | ${entry.title}`;
+        });
       }
-      mimeType = 'text/plain';
-      downloadName = `${context.fileName}.txt`;
+    } catch (err) {
+      console.warn('[Coda Logger] Failed to parse log JSON for text export:', err);
     }
 
-    const blob = new Blob([content], { type: mimeType });
+    const content = logLines.join('\n') || '(no entries logged yet)';
+    const blob = new Blob([content], { type: 'text/plain' });
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
-    link.download = downloadName;
+    link.download = `${context.fileName}.txt`;
     link.click();
     URL.revokeObjectURL(link.href);
   }
