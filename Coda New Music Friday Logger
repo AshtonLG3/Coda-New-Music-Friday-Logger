@@ -576,7 +576,7 @@
       console.error('[Coda Logger] ERROR: Still cannot find any row.');
       return;
     }
-      
+
     console.log('[Coda Logger] Found parent row element:', row);
 
     waitForStableRow(row).then((data) => {
@@ -623,9 +623,9 @@
     const text = normaliseWhitespace(button.innerText || button.textContent || '').toLowerCase();
       console.log("TEXT FOUND:", text);
 
-    if (text === 'close task') {
-  console.log('[Coda Logger] "Close task" button confirmed.');
-  logTask(button, 'close');
+    if (text.includes('close') && text.includes('task')) {
+    console.log('[Coda Logger] "Close task" button confirmed.');
+    logTask(button, 'close');
 }
   }
 
