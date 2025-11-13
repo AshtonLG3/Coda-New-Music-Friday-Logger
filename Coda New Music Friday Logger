@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Coda Task Logger (Memory + Manual Export)
 // @namespace    mxm-tools
-// @version      1.2.0
+// @version      1.2.1
 // @description  Stores Coda task logs in Tampermonkey memory and lets you download them anytime.
 // @author       Richie
 // @match        https://coda.io/*
@@ -310,6 +310,15 @@
     );
   }
 
+  function findSelectedRow() {
+    return (
+      document.querySelector('[aria-selected="true"]') ||
+      document.querySelector('[data-selected="true"]') ||
+      document.querySelector('.is-selected') ||
+      document.querySelector('[class*="selected"]')
+    );
+  }
+
   function getRowCells(row) {
     if (!row) return [];
     const selectors = [
@@ -555,9 +564,16 @@
 
   function logTask(button, trigger) {
     console.log('[Coda Logger] logTask() called for trigger:', trigger);
-    const row = findRowElement(button);
+    let row = findRowElement(button);
+
+    // NEW: fallback to currently selected row
     if (!row) {
-      console.error('[Coda Logger] ERROR: Could not find parent row element for the button.');
+      console.warn('[Coda Logger] No row near button — using selected row.');
+      row = findSelectedRow();
+    }
+
+    if (!row) {
+      console.error('[Coda Logger] ERROR: Still cannot find any row.');
       return;
     }
       
