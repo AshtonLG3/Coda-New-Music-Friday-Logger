@@ -667,4 +667,99 @@
       createDownloadButton();
     }
   });
+
+    // ---------- CLEAR LOGS & NEW WEEK BUTTONS ----------
+function clearCurrentLogs() {
+  const context = getActiveLogContext();
+
+  // Remove current log data
+  writeStorage(context.logKey, '[]');
+
+  // Optional: also reset saved window state
+  writeStorage(WINDOW_STATE_KEY, '');
+
+  alert(`✔️ Cleared logs for: ${context.fileName}`);
+}
+
+function startNewWeekLogs() {
+  const now = new Date();
+
+  // Compute next Thursday 15:00
+  const { end } = getCurrentNMFWindow(now);
+  const nextStart = new Date(end); // Start of new week
+  nextStart.setHours(15, 0, 0, 0);
+
+  const newContext = getActiveLogContext(nextStart);
+
+  // Reset the log file for new week
+  writeStorage(newContext.logKey, '[]');
+  writeStorage(WINDOW_STATE_KEY, JSON.stringify({
+    start: newContext.start.toISOString(),
+    end: newContext.end.toISOString(),
+    fileName: newContext.fileName,
+    logKey: newContext.logKey
+  }));
+
+  alert(`🆕 Started new week log: ${newContext.fileName}`);
+}
+
+function createUtilityButtons() {
+  if (!isTopLevelContext()) return;
+
+  // Prevent duplication
+  if (document.querySelector('[data-coda-task-logger="clear"]')) return;
+
+  // --- Clear Logs Button ---
+  const clearBtn = document.createElement('button');
+  clearBtn.textContent = '🗑 Clear Logs';
+  clearBtn.dataset.codaTaskLogger = 'clear';
+  Object.assign(clearBtn.style, {
+    position: 'fixed',
+    bottom: '60px',
+    right: '20px',
+    background: '#d93025',
+    color: '#fff',
+    border: 'none',
+    borderRadius: '8px',
+    padding: '10px 16px',
+    fontSize: '14px',
+    fontWeight: '600',
+    cursor: 'pointer',
+    boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
+    zIndex: 999999,
+  });
+  clearBtn.addEventListener('click', clearCurrentLogs);
+  document.body.appendChild(clearBtn);
+
+  // --- Start New Week Button ---
+  const newWeekBtn = document.createElement('button');
+  newWeekBtn.textContent = '🆕 New Week';
+  newWeekBtn.dataset.codaTaskLogger = 'newweek';
+  Object.assign(newWeekBtn.style, {
+    position: 'fixed',
+    bottom: '100px',
+    right: '20px',
+    background: '#34a853',
+    color: '#fff',
+    border: 'none',
+    borderRadius: '8px',
+    padding: '10px 16px',
+    fontSize: '14px',
+    fontWeight: '600',
+    cursor: 'pointer',
+    boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
+    zIndex: 999999,
+  });
+  newWeekBtn.addEventListener('click', startNewWeekLogs);
+  document.body.appendChild(newWeekBtn);
+}
+
+// Call them together with download button creator
+if (isTopLevelContext()) {
+  setTimeout(() => {
+    createDownloadButton();
+    createUtilityButtons();
+  }, 2000);
+}
+
 })();
