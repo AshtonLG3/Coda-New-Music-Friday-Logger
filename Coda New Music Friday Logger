@@ -606,13 +606,10 @@
     const text = normaliseWhitespace(button.innerText || button.textContent || '').toLowerCase();
     console.log('[Coda Logger] Button text is:', text);
 
-    if (text.includes('take') && text.includes('task')) {
-      console.log('[Coda Logger] "Take task" button confirmed.');
-      logTask(button, 'take');
-    } else if (text.includes('close') && text.includes('task')) {
-      console.log('[Coda Logger] "Close task" button confirmed.');
-      logTask(button, 'close');
-    }
+    if (text === 'close task') {
+  console.log('[Coda Logger] "Close task" button confirmed.');
+  logTask(button, 'close');
+}
   }
 
   // ---------- UI Button ----------
