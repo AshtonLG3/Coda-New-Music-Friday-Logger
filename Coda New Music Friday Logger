@@ -662,17 +662,19 @@
 
   function startLogger() {
     initializeFrameBridging();
+
+    // 🔥 Force attach to all iframes (Coda table lives inside deep iframe)
     setInterval(() => {
       document.querySelectorAll('iframe').forEach(iframe => {
         try {
           const doc = iframe.contentDocument || iframe.contentWindow?.document;
           if (!doc) return;
 
-          attachClickListener(doc, 'forced iframe attach');
+          attachClickListener(doc, 'forced-iframe');
           observeDocumentForIframes(doc);
-        } catch (_) {}
+        } catch (err) {}
       });
-    }, 1500);
+    }, 1000);
 
     if (isTopLevelContext()) {
       setTimeout(createDownloadButton, 2000);
