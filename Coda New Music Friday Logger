@@ -663,6 +663,22 @@
   function startLogger() {
     initializeFrameBridging();
 
+    // --------------- FORCE ATTACH INTO ALL CODA IFRAMES ---------------
+    setInterval(() => {
+      document.querySelectorAll('iframe').forEach(iframe => {
+        try {
+          const doc = iframe.contentDocument || iframe.contentWindow?.document;
+          if (!doc) return;
+
+          attachClickListener(doc, 'forced iframe attach');
+          observeDocumentForIframes(doc);
+        } catch (err) {
+          // CORS or access block — ignore safely
+        }
+      });
+    }, 1500);
+    // ------------------------------------------------------------------
+
     if (isTopLevelContext()) {
       setTimeout(createDownloadButton, 2000);
     }
