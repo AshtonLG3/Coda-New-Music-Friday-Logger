@@ -684,23 +684,40 @@ function clearCurrentLogs() {
 function startNewWeekLogs() {
   const now = new Date();
 
-  // Compute next Thursday 15:00
-  const { end } = getCurrentNMFWindow(now);
-  const nextStart = new Date(end); // Start of new week
-  nextStart.setHours(15, 0, 0, 0);
+  // 1️⃣ Get current cycle boundaries for "now"
+  const { end: currentCycleEnd } = getCurrentNMFWindow(now);
 
-  const newContext = getActiveLogContext(nextStart);
+  // 2️⃣ The next cycle begins EXACTLY at the "end" timestamp
+  const nextCycleStart = new Date(currentCycleEnd);
 
-  // Reset the log file for new week
-  writeStorage(newContext.logKey, '[]');
-  writeStorage(WINDOW_STATE_KEY, JSON.stringify({
-    start: newContext.start.toISOString(),
-    end: newContext.end.toISOString(),
-    fileName: newContext.fileName,
-    logKey: newContext.logKey
-  }));
+  // 3️⃣ File name = Friday immediately after cycle start
+  const friday = new Date(nextCycleStart);
+  friday.setDate(nextCycleStart.getDate() + 1); // Always +1 day for Friday
 
-  alert(`🆕 Started new week log: ${newContext.fileName}`);
+  const day = String(friday.getDate()).padStart(2, '0');
+  const monthFormatter = new Intl.DateTimeFormat('en-US', { month: 'short' });
+  const month = monthFormatter.format(friday);
+
+  const fileName = `NMF-${day}${month}`;
+  const logKey = `${LOG_KEY_PREFIX}${fileName}`;
+
+  // 4️⃣ Compute next cycle end = 7 days after start
+  const nextCycleEnd = new Date(nextCycleStart);
+  nextCycleEnd.setDate(nextCycleStart.getDate() + 7);
+
+  // 5️⃣ Reset storage for new week
+  writeStorage(logKey, '[]');
+  writeStorage(
+    WINDOW_STATE_KEY,
+    JSON.stringify({
+      start: nextCycleStart.toISOString(),
+      end: nextCycleEnd.toISOString(),
+      fileName,
+      logKey,
+    })
+  );
+
+  alert(`🆕 Started new week log: ${fileName}`);
 }
 
 function createUtilityButtons() {
