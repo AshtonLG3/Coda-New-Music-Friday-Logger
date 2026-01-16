@@ -1,809 +1,707 @@
 // ==UserScript==
-// @name         Coda Task Logger (Memory + Manual Export)
-// @namespace    mxm-tools
-// @version      1.2.1
-// @description  Stores Coda task logs in Tampermonkey memory and lets you download them anytime.
-// @author       Richie
+// @name         Coda Mission Tracker (Draggable v5)
+// @namespace    coda-tools
+// @version      5.0.3
+// @description  v5.0.3: Replaces Reset with Hard Wipe (permanently deletes logs for the cycle)
+// @author       Richard Mangezi Muketa
 // @match        https://coda.io/*
-// @run-at       document-end
-// @noframes     false
-// @grant        unsafeWindow
-// @grant        GM_setClipboard
-// @grant        GM_getValue
-// @grant        GM_setValue
-// @grant        GM_download
+// @grant        none
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  const LOG_KEY_PREFIX = 'coda_task_log::';
-  const WINDOW_STATE_KEY = 'coda_task_log_window_state';
-  const DEFAULT_FILE_EXTENSION = '.json';
   const DEBUG = true;
-  const STABILITY_CHECKS = 12;
-  const STABILITY_INTERVAL = 150;
-  const FRAME_REATTACH_INTERVAL = 3000;
-  const ELEMENT_NODE = typeof Node !== 'undefined' ? Node.ELEMENT_NODE : 1;
 
-  const attachedDocuments = new WeakSet();
-  const observedDocuments = new WeakMap();
-  const processedIframes = new WeakSet();
-  const hostWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-
-  const COLUMN_KEYWORDS = {
-    isrc: ['isrc', 'isrc code', 'isrc#'],
-    artist: [
-      'artist',
-      'artist name',
-      'primary artist',
-      'main artist',
-      'performer',
-      'creator',
-      'writer',
-    ],
-    title: [
-      'title',
-      'title name',
-      'track name',
-      'song title',
-      'track',
-      'track title',
-    ],
-  };
-
-  function matchesKeyword(candidate, keywords) {
-    return keywords.some((keyword) => candidate.includes(keyword));
-  }
-
-  // ---------- Helpers ----------
-  const ts = (date = new Date()) => {
-    const d = date instanceof Date ? date : new Date(date);
-    const p = (n) => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
-  };
-
-  function readStorage(key, fallback = '') {
-    try {
-      if (typeof GM_getValue === 'function') {
-        return GM_getValue(key, fallback);
-      }
-    } catch (err) {
-      console.warn('[Coda Logger] GM_getValue failed, falling back to localStorage.', err);
-    }
-
-    try {
-      const value = localStorage.getItem(key);
-      return value === null ? fallback : value;
-    } catch (err) {
-      console.error('[Coda Logger] Failed to read from localStorage:', err);
-      return fallback;
-    }
-  }
-
-  function writeStorage(key, value) {
-    try {
-      if (typeof GM_setValue === 'function') {
-        GM_setValue(key, value);
-        return;
-      }
-    } catch (err) {
-      console.warn('[Coda Logger] GM_setValue failed, falling back to localStorage.', err);
-    }
-
-    try {
-      localStorage.setItem(key, value);
-    } catch (err) {
-      console.error('[Coda Logger] Failed to write to localStorage:', err);
-    }
-  }
-
-  function getCurrentNMFWindow(referenceDate = new Date()) {
-    const now = referenceDate instanceof Date ? new Date(referenceDate.getTime()) : new Date(referenceDate);
-    const day = now.getDay();
-
-    const currentThursday = new Date(now);
-    currentThursday.setDate(now.getDate() - ((day + 7 - 4) % 7));
-    currentThursday.setHours(15, 0, 0, 0);
-
-    if (now < currentThursday) {
-      currentThursday.setDate(currentThursday.getDate() - 7);
-    }
-
-    const nextThursday = new Date(currentThursday);
-    nextThursday.setDate(nextThursday.getDate() + 7);
-    nextThursday.setHours(15, 0, 0, 0);
-
-    return { start: currentThursday, end: nextThursday };
-  }
-
-  function getNMFFileName(referenceDate = new Date()) {
-    const { start } = getCurrentNMFWindow(referenceDate);
-    const friday = new Date(start);
-    friday.setDate(start.getDate() + 1);
-
-    const day = String(friday.getDate()).padStart(2, '0');
-    const monthFormatter = new Intl.DateTimeFormat('en-US', { month: 'short' });
-    const month = monthFormatter.format(friday);
-
-    return `NMF-${day}${month}`;
-  }
-
-  function getActiveLogContext(referenceDate = new Date()) {
-    const { start, end } = getCurrentNMFWindow(referenceDate);
-    const fileName = getNMFFileName(referenceDate);
-    const logKey = `${LOG_KEY_PREFIX}${fileName}`;
-
-    const payload = {
-      start: start.toISOString(),
-      end: end.toISOString(),
-      fileName,
-      logKey,
-    };
-
-    try {
-      const cachedRaw = readStorage(WINDOW_STATE_KEY, '');
-      if (!cachedRaw) {
-        writeStorage(WINDOW_STATE_KEY, JSON.stringify(payload));
-      } else {
-        try {
-          const cached = JSON.parse(cachedRaw);
-          if (
-            cached?.logKey !== payload.logKey ||
-            cached?.start !== payload.start ||
-            cached?.end !== payload.end ||
-            cached?.fileName !== payload.fileName
-          ) {
-            writeStorage(WINDOW_STATE_KEY, JSON.stringify(payload));
-          }
-        } catch (err) {
-          console.warn('[Coda Logger] Failed to parse cached window state. Resetting.', err);
-          writeStorage(WINDOW_STATE_KEY, JSON.stringify(payload));
-        }
-      }
-    } catch (err) {
-      console.warn('[Coda Logger] Unable to persist window state:', err);
-    }
-
-    return {
-      start,
-      end,
-      fileName,
-      logKey,
-    };
-  }
-
-  function getActiveLogFile(referenceDate = new Date()) {
-    const { fileName } = getActiveLogContext(referenceDate);
-    return `${fileName}${DEFAULT_FILE_EXTENSION}`;
-  }
-
-  function normaliseWhitespace(value) {
-    return (value || '').replace(/\s+/g, ' ').trim();
-  }
-
-  function isTopLevelContext() {
-    try {
-      return hostWindow.top === hostWindow.self;
-    } catch (err) {
-      return window.top === window.self;
-    }
-  }
-
-  function attachClickListener(targetDoc, label = 'document') {
-    if (!targetDoc || attachedDocuments.has(targetDoc)) {
-      return;
-    }
-
-    targetDoc.addEventListener('click', handleClick, true);
-    attachedDocuments.add(targetDoc);
-
-    if (DEBUG) {
-      console.log(`[Coda Logger] Attached click listener to ${label}.`);
-    }
-  }
-
-  function observeDocumentForIframes(targetDoc) {
-    if (!targetDoc || observedDocuments.has(targetDoc)) {
-      return;
-    }
-
-    const observer = new MutationObserver((mutations) => {
-      for (const mutation of mutations) {
-        for (const node of mutation.addedNodes || []) {
-          if (!node || node.nodeType !== ELEMENT_NODE) {
-            continue;
-          }
-
-          if (node.tagName === 'IFRAME') {
-            registerIframe(node);
-          }
-
-          const nestedIframes = node.querySelectorAll?.('iframe');
-          if (nestedIframes && nestedIframes.length) {
-            nestedIframes.forEach(registerIframe);
-          }
-        }
-      }
-    });
-
-    observer.observe(targetDoc, { childList: true, subtree: true });
-    observedDocuments.set(targetDoc, observer);
-  }
-
-  function isCodaIframe(iframe) {
-    if (!iframe) return false;
-
-    const src = iframe.getAttribute('src') || '';
-    const id = iframe.id || '';
-    const className = typeof iframe.className === 'string' ? iframe.className : '';
-    const dataTestId = iframe.getAttribute('data-testid') || '';
-
-    return (
-      /coda\.io/i.test(src) ||
-      /EmbedIframe/i.test(id) ||
-      /FullPageEmbedIframe/i.test(id) ||
-      /EmbedIframe/i.test(className) ||
-      /FullPageEmbedIframe/i.test(className) ||
-      /EmbedIframe/i.test(dataTestId) ||
-      /FullPageEmbedIframe/i.test(dataTestId)
-    );
-  }
-
-  function registerIframe(iframe) {
-    if (!iframe || processedIframes.has(iframe) || !isCodaIframe(iframe)) {
-      return;
-    }
-
-    processedIframes.add(iframe);
-
-    const attach = () => {
-      try {
-        const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
-        if (!iframeDoc) {
-          return;
-        }
-
-        attachClickListener(iframeDoc, 'iframe document');
-        observeDocumentForIframes(iframeDoc);
-      } catch (err) {
-        console.error('[Coda Logger] Iframe access error:', err);
-      }
-    };
-
-    attach();
-    iframe.addEventListener('load', attach);
-  }
-
-  function attachToIframes(rootDoc = document) {
-    if (!rootDoc) return;
-
-    const iframes = rootDoc.querySelectorAll?.('iframe');
-    if (!iframes || !iframes.length) {
-      return;
-    }
-
-    iframes.forEach(registerIframe);
-  }
-
-  function initializeFrameBridging() {
-    const label = isTopLevelContext() ? 'top document' : 'embedded document';
-    attachClickListener(document, label);
-    observeDocumentForIframes(document);
-    attachToIframes(document);
-
-    if (!hostWindow.__codaTaskLoggerFrameTimer) {
-      hostWindow.__codaTaskLoggerFrameTimer = hostWindow.setInterval(() => {
-        attachToIframes(document);
-      }, FRAME_REATTACH_INTERVAL);
-    }
-  }
-
-  function findRowElement(element) {
-    if (!element) return null;
-    return (
-      element.closest('tr') ||
-      element.closest('[role="row"]') ||
-      element.closest('[data-row-id]') ||
-      element.closest('[data-testid="canvas-view-row"]') ||
-      null
-    );
-  }
-
-  function findSelectedRow() {
-    return (
-      document.querySelector('[aria-selected="true"]') ||
-      document.querySelector('[data-selected="true"]') ||
-      document.querySelector('.is-selected') ||
-      document.querySelector('[class*="selected"]')
-    );
-  }
-
-  function getRowCells(row) {
-    if (!row) return [];
-    const selectors = [
-      '[role="gridcell"]',
-      'td',
-      '[data-column-id]',
-      '[data-testid="canvas-view-cell"]',
-      '[data-testid="tableColumnCell"]',
-    ];
-
-    for (const selector of selectors) {
-      const cells = Array.from(row.querySelectorAll(selector));
-      if (cells.length) {
-        return cells;
-      }
-    }
-
-    // Fallback: use direct children
-    return Array.from(row.children || []);
-  }
-
-  function detectByLabel(cell, text) {
-    const candidate = [
-      cell?.dataset?.columnId,
-      cell?.dataset?.columnName,
-      cell?.dataset?.columnLabel,
-      cell?.getAttribute('data-column-id'),
-      cell?.getAttribute('data-column-label'),
-      cell?.getAttribute('aria-label'),
-      text,
-    ]
-      .map((value) => value || '')
-      .join(' ')
-      .toLowerCase();
-
-    return {
-      isISRC:
-        matchesKeyword(candidate, COLUMN_KEYWORDS.isrc) || /\bisrc\b/.test(candidate),
-      isArtist: matchesKeyword(candidate, COLUMN_KEYWORDS.artist),
-      isTitle: matchesKeyword(candidate, COLUMN_KEYWORDS.title),
-    };
-  }
-
-  function extractRowData(row) {
-    if (!row) return null;
-
-    const cells = getRowCells(row);
-    if (!cells.length) return null;
-
-    const result = { isrc: '', artist: '', title: '' };
-
-    const cellTexts = cells.map((cell) => normaliseWhitespace(cell.innerText || cell.textContent || ''));
-
-    if (DEBUG) {
-      console.log('[Coda Logger] Found cell texts:', cellTexts);
-    }
-
-    cells.forEach((cell, index) => {
-      const text = cellTexts[index];
-      if (!text) return;
-      const { isISRC, isArtist, isTitle } = detectByLabel(cell, text);
-      if (isISRC && !result.isrc) {
-        result.isrc = text;
-      } else if (isArtist && !result.artist) {
-        result.artist = text;
-      } else if (isTitle && !result.title) {
-        result.title = text;
-      }
-    });
-
-    const cleanedTexts = cellTexts.filter((text) => {
-      if (!text) return false;
-      if (/take\s+the\s+task/i.test(text)) return false;
-      if (/close\s+task/i.test(text)) return false;
-      if (/^\d+$/.test(text)) return false; // row index numbers
-      return true;
-    });
-
-    const isrcPattern = /[A-Z]{2}-?[A-Z0-9]{3}-?\d{2}-?\d{5}/;
-    if (!result.isrc) {
-      const isrcCandidate = cleanedTexts.find((text) => isrcPattern.test(text.toUpperCase()));
-      if (isrcCandidate) {
-        result.isrc = isrcCandidate.toUpperCase();
-      }
-    }
-
-    const remaining = cleanedTexts.filter((text) => text !== result.isrc);
-    if (!result.artist && remaining.length) {
-      const artistCandidate = remaining.find((text) => {
-        const cellIndex = cellTexts.indexOf(text);
-        if (cellIndex === -1) return false;
-        const { isArtist } = detectByLabel(cells[cellIndex], text);
-        return isArtist;
-      });
-      result.artist = artistCandidate || remaining[0];
-    }
-    if (!result.title && remaining.length > 1) {
-      const remainingWithoutArtist = remaining.filter((text) => text !== result.artist);
-      const titleCandidate = remainingWithoutArtist.find((text) => {
-        const cellIndex = cellTexts.indexOf(text);
-        if (cellIndex === -1) return false;
-        const { isTitle } = detectByLabel(cells[cellIndex], text);
-        return isTitle;
-      });
-      result.title =
-        titleCandidate ||
-        remainingWithoutArtist[0] ||
-        remaining.find((text) => text !== result.artist) ||
-        remaining[1] ||
-        remaining[0];
-    }
-
-    return {
-      isrc: result.isrc || 'N/A',
-      artist: result.artist || 'N/A',
-      title: result.title || 'N/A',
-    };
-  }
-
-  function waitForStableRow(
-    row,
-    attempts = STABILITY_CHECKS,
-    intervalMs = STABILITY_INTERVAL
-  ) {
-    return new Promise((resolve) => {
-      if (!row) {
-        resolve(null);
-        return;
-      }
-
-      const totalAttempts = attempts;
-      const interval = setInterval(() => {
-        if (!row.isConnected) {
-          clearInterval(interval);
-          resolve(null);
-          return;
-        }
-
-        const data = extractRowData(row);
-        const isReady = data && data.isrc && data.isrc !== 'N/A';
-
-        if (isReady) {
-          clearInterval(interval);
-          console.log(
-            `[Coda Logger] Row stabilized after ${totalAttempts - attempts + 1} checks.`
-          );
-          resolve(data);
-        } else if (--attempts <= 0) {
-          clearInterval(interval);
-          resolve(data || null);
-        }
-      }, intervalMs);
-    });
-  }
-
-  function appendToMemory(entry, referenceDate = new Date()) {
-    try {
-      const context = getActiveLogContext(referenceDate);
-      const raw = readStorage(context.logKey, '[]');
-      let logEntries = [];
-
-      if (raw) {
-        try {
-          const parsed = JSON.parse(raw);
-          if (Array.isArray(parsed)) {
-            logEntries = parsed;
-          }
-        } catch (err) {
-          console.warn('[Coda Logger] Existing log data was not valid JSON. Resetting.', err);
-        }
-      }
-
-      logEntries.push(entry);
-      writeStorage(context.logKey, JSON.stringify(logEntries));
-
-      if (DEBUG) {
-        console.log('[Coda Logger] Log entry stored.', {
-          file: getActiveLogFile(referenceDate),
-          windowStart: context.start,
-          windowEnd: context.end,
-          entry,
-        });
-      }
-    } catch (err) {
-      console.error('[Coda Logger] ERROR saving log:', err);
-    }
-  }
-
-  function downloadLog() {
-    const context = getActiveLogContext();
-    const raw = readStorage(context.logKey, '[]');
-
-    let logLines = [];
-    try {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        logLines = parsed.map(entry => {
-          const date = new Date(entry.timestamp);
-          const pad = n => String(n).padStart(2, '0');
-          const stamp = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
-          return `${stamp} | ${entry.isrc} | ${entry.artist} | ${entry.title}`;
-        });
-      }
-    } catch (err) {
-      console.warn('[Coda Logger] Failed to parse log JSON for text export:', err);
-    }
-
-    const content = logLines.join('\n') || '(no entries logged yet)';
-    const blob = new Blob([content], { type: 'text/plain' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = `${context.fileName}.txt`;
-    link.click();
-    URL.revokeObjectURL(link.href);
-  }
-
-  function provideFeedback(button, trigger) {
-    if (!button) return;
-    const isNativeButton = button.tagName === 'BUTTON';
-    if (!isNativeButton) {
-      button.setAttribute('data-coda-task-logger-feedback', '1');
-      button.style.outline = '2px solid #28a745';
-      button.style.outlineOffset = '2px';
-      setTimeout(() => {
-        if (button.getAttribute('data-coda-task-logger-feedback')) {
-          button.style.outline = '';
-          button.style.outlineOffset = '';
-          button.removeAttribute('data-coda-task-logger-feedback');
-        }
-      }, 1200);
-      return;
-    }
-
-    const original = button.textContent;
-    const originalBg = button.style.backgroundColor;
-    button.textContent = trigger === 'take' ? '✅ Logged!' : '✅ Log saved';
-    button.style.backgroundColor = '#28a745';
-    setTimeout(() => {
-      button.textContent = original;
-      button.style.backgroundColor = originalBg;
-    }, 2000);
-  }
-
-  function logTask(button, trigger) {
-    console.log('[Coda Logger] logTask() called for trigger:', trigger);
-    let row = findRowElement(button);
-
-    // NEW: fallback to currently selected row
-    if (!row) {
-      console.warn('[Coda Logger] No row near button — using selected row.');
-      row = findSelectedRow();
-    }
-
-    if (!row) {
-      console.error('[Coda Logger] ERROR: Still cannot find any row.');
-      return;
-    }
-
-    console.log('[Coda Logger] Found parent row element:', row);
-
-    waitForStableRow(row).then((data) => {
-      if (!data) {
-        console.error('[Coda Logger] ERROR: Failed to extract row data after waiting for stability.');
-        return;
-      }
-
-      if (data.isrc === 'N/A') {
-        console.warn('[Coda Logger] WARNING: Row data stabilized but ISRC is still missing.');
-      }
-
-      const now = new Date();
-      const line = `${ts(now)} | ${data.isrc} | ${data.artist} | ${data.title}`;
-      console.log('[Coda Logger] SUCCESS: Data extracted:', line);
-      GM_setClipboard(line);
-      appendToMemory(
-        {
-          timestamp: now.toISOString(),
-          isrc: data.isrc,
-          artist: data.artist,
-          title: data.title,
+  const CONFIG = {
+    missions: {
+      nmf: {
+        id: 'nmf',
+        urlSignature: '_suqO9aln',
+        name: 'New Music Friday',
+        cycle: { anchorDow: 4, anchorHour: 15, anchorMinute: 0 },
+        cycleLabelMode: 'friday_of_cycle',
+        closeTask: {
+          labelText: 'Close Task',
+          secondaryText: 'Close task',
+          svgHint: 'task-completed.svg'
         },
-        now
-      );
-      provideFeedback(button, trigger);
-    });
+        rowDataUrlHints: []
+      },
+      apple_sprint: {
+        id: 'apple_sprint',
+        urlSignature: '_suR3dVuO',
+        name: 'Apple Coda Sprint',
+        thursdayOnly: false,
+        closeTask: {
+          labelText: 'Close task',
+          objectIdPrefix: 'grid-sync-1054',
+          svgHint: 'task-completed.svg'
+        },
+        cycleLabelMode: 'today',
+        rowDataUrlHints: []
+      }
+    },
+
+    storageKeys: {
+      logPrefix: 'coda_task_log::',
+      posKey: 'coda_tracker_pos' // Stores {top, left}
+    },
+
+    ui: {
+      theme: {
+        bg: '#0b1f33',
+        text: '#f5c77a',
+        border: '#1a73e8',
+        header: '#081624'
+      }
+    },
+
+    network: {
+      enable: true,
+      allowedHosts: ['coda.io', 'www.coda.io', 'codacontent.io', 'codahosted.io', 'cdn.coda.io']
+    },
+
+    isrcRegex: /\b[A-Z]{2}[A-Z0-9]{3}\d{7}\b/,
+    snapshotThrottleMs: 200
+  };
+
+  let currentMission = null;
+  let clickListenerInstalled = false;
+  let pointerListenerInstalled = false;
+  let routeHooksInstalled = false;
+  let networkInstalled = false;
+  let isDockCollapsed = false;
+
+  let lastRowSnapshot = null;
+  let lastSnapshotAt = 0;
+
+  function logDebug(...args) {
+    if (!DEBUG) return;
+    console.log('[CodaTracker]', ...args);
   }
 
-  // ---------- Core Logic ----------
-  function handleClick(e) {
-    const target = e.target;
+  // --- Date Helpers ---
+  function pad2(n) { return String(n).padStart(2, '0'); }
+  function fmtYmd(d) { return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; }
+  function fmtLocalDateTime(d) { return `${fmtYmd(d)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`; }
+  function startOfDay(d) { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; }
+  function addDays(d, days) { const x = new Date(d); x.setDate(x.getDate() + days); return x; }
+  function safeJsonParse(str, fallback) { try { return JSON.parse(str); } catch { return fallback; } }
+  function stableHash(str) {
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = (h * 16777619) >>> 0; }
+    return h.toString(16);
+  }
+
+  // --- Mission Logic ---
+  function detectMission() {
+    const url = location.href;
+    for (const k in CONFIG.missions) {
+      const m = CONFIG.missions[k];
+      if (m.urlSignature && url.includes(m.urlSignature)) return m;
+    }
+    return null;
+  }
+
+  function getNmfCycle(now = new Date()) {
+    const c = CONFIG.missions.nmf.cycle;
+    const d = new Date(now);
+    const day = d.getDay();
+    const diff = (day + 7 - c.anchorDow) % 7;
+    const anchor = new Date(d);
+    anchor.setDate(d.getDate() - diff);
+    anchor.setHours(c.anchorHour, c.anchorMinute, 0, 0);
+    const end = addDays(anchor, 7);
+    return { anchor, end };
+  }
+
+  function nmfCycleLabel(now = new Date()) {
+    const { anchor } = getNmfCycle(now);
+    const friday = addDays(startOfDay(anchor), 1);
+    return fmtYmd(friday);
+  }
+
+  function appleCycleLabel(now = new Date()) { return fmtYmd(startOfDay(now)); }
+  function getCycleLabel(mission, now = new Date()) {
+    if (!mission) return fmtYmd(now);
+    if (mission.id === 'nmf') return nmfCycleLabel(now);
+    if (mission.id === 'apple_sprint') return appleCycleLabel(now);
+    return fmtYmd(now);
+  }
+
+  // --- Storage ---
+  function storageKey(missionId, cycleLabel) { return `${CONFIG.storageKeys.logPrefix}${missionId}::${cycleLabel}`; }
+  function readHistory(missionId, cycleLabel) { return safeJsonParse(localStorage.getItem(storageKey(missionId, cycleLabel)) || '[]', []); }
+  function writeHistory(missionId, cycleLabel, history) { localStorage.setItem(storageKey(missionId, cycleLabel), JSON.stringify(history)); }
+
+  // --- Manual Done Count Controls ---
+
+  function getCurrentHistoryBundle() {
+    if (!currentMission) return null;
+    const cycleLabel = getCycleLabel(currentMission, new Date());
+    const history = readHistory(currentMission.id, cycleLabel);
+    return { cycleLabel, history };
+  }
+
+  function persistHistoryAndRefresh(cycleLabel, history) {
+    writeHistory(currentMission.id, cycleLabel, history);
+    const closedCount = history.filter(h => h.status === 'closed').length;
+    const last = history.length > 0 ? history[history.length - 1] : null;
+    if (last) updateUI(last, closedCount);
+    else updateUI({ status: 'waiting' }, 0);
+  }
+
+  // REPLACED: This now performs a HARD WIPE of the storage file
+  function wipeLogs() {
+    if (!currentMission) return;
+
+    if (!confirm("⚠️ DELETE ALL LOGS? ⚠️\n\nThis will permanently delete the JSON/TXT records for this cycle.\nUse this to remove false captures.\n\nConfirm?")) return;
+
+    const cycleLabel = getCycleLabel(currentMission, new Date());
+    const key = storageKey(currentMission.id, cycleLabel);
+
+    // Physically remove the key from storage
+    localStorage.removeItem(key);
+
+    // Refresh UI
+    loadInitialCount();
+    refreshStatus();
+    updateStatusLine('Cycle logs wiped.');
+  }
+
+  function adjustDoneCount(delta) {
+    const bundle = getCurrentHistoryBundle();
+    if (!bundle) return;
+    const { cycleLabel, history } = bundle;
+
+    const steps = Math.abs(delta);
+    let changed = 0;
+
+    if (delta < 0) {
+      for (let i = 0; i < steps; i++) {
+        let idx = -1;
+        for (let j = history.length - 1; j >= 0; j--) {
+          if (history[j].status === 'closed') { idx = j; break; }
+        }
+        if (idx === -1) break;
+        history[idx].status = 'open';
+        history[idx].manual_adjust = 'dec';
+        history[idx].manual_adjust_at = new Date().toISOString();
+        changed++;
+      }
+    } else if (delta > 0) {
+      for (let i = 0; i < steps; i++) {
+        let idx = -1;
+        for (let j = history.length - 1; j >= 0; j--) {
+          if (history[j].status !== 'closed') { idx = j; break; }
+        }
+        if (idx !== -1) {
+          history[idx].status = 'closed';
+          history[idx].manual_adjust = 'inc';
+          history[idx].manual_adjust_at = new Date().toISOString();
+          changed++;
+        } else {
+          // If everything is already closed (or history is empty), add a manual entry
+          history.push({
+            ts: new Date().toISOString(),
+            status: 'closed',
+            source: 'manual_inc',
+            last_seen: Date.now(),
+            datetime: fmtLocalDateTime(new Date()),
+            title: 'Manual count increment',
+            manual_adjust: 'inc'
+          });
+          changed++;
+        }
+      }
+    }
+
+    persistHistoryAndRefresh(cycleLabel, history);
+    logDebug(`[Manual] Adjust Done count by ${delta}: applied ${changed}`);
+  }
+
+
+  function computeTaskId(missionId, rowData) {
+    if (rowData.stable_id) return `${missionId}::${rowData.stable_id}`;
+    if (rowData.row_testid) return `${missionId}::${rowData.row_testid}`;
+    if (rowData.isrc) return `${missionId}::isrc:${rowData.isrc}`;
+    return `${missionId}::h:${stableHash((rowData.primary_text || '') + '||' + (rowData.raw_data || ''))}`;
+  }
+
+  // --- Data Extraction ---
+  function parseFieldsFromValues(values, fallbackDateTimeStr) {
+    const out = { datetime: fallbackDateTimeStr, isrc: '', artist: '', title: '' };
+    if (!Array.isArray(values) || values.length === 0) return out;
+
+    let isrcIndex = -1;
+    for (let i = 0; i < values.length; i++) {
+      const m = String(values[i]).match(CONFIG.isrcRegex);
+      if (m) { out.isrc = m[0]; isrcIndex = i; break; }
+    }
+
+    const dtRegex = /^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$/;
+    if (isrcIndex > 0) {
+      const prev = String(values[isrcIndex - 1]).trim();
+      if (dtRegex.test(prev)) out.datetime = prev;
+    }
+
+    const cleaned = values.map(v => String(v).trim()).filter(v => v && !dtRegex.test(v) && !(CONFIG.isrcRegex.test(v)));
+
+    if (isrcIndex >= 0) {
+      const artistCandidate = (values[isrcIndex + 1] != null) ? String(values[isrcIndex + 1]).trim() : '';
+      const titleCandidate = (values[isrcIndex + 2] != null) ? String(values[isrcIndex + 2]).trim() : '';
+      if (artistCandidate) out.artist = artistCandidate.replaceAll('_', ' ');
+      if (titleCandidate) out.title = titleCandidate.replaceAll('_', ' ');
+      if (!out.artist) out.artist = (cleaned[0] || '').replaceAll('_', ' ');
+      if (!out.title) out.title = (cleaned[1] || '').replaceAll('_', ' ');
+    } else {
+      out.artist = (cleaned[0] || '').replaceAll('_', ' ');
+      out.title = (cleaned[1] || '').replaceAll('_', ' ');
+    }
+    return out;
+  }
+
+  function toExportLine(entry) {
+    const dt = entry.datetime || fmtLocalDateTime(new Date(entry.last_seen || Date.now()));
+    return [dt, entry.isrc || '', entry.artist || '', entry.title || ''].filter(Boolean).join(' ').trim();
+  }
+
+  function upsertTask({ mission, rowData, status, source, meta }) {
+    const now = new Date();
+    const cycleLabel = getCycleLabel(mission, now);
+    const history = readHistory(mission.id, cycleLabel);
+
+    const ts = now.toISOString();
+    const taskId = computeTaskId(mission.id, rowData);
+    let entry = history.find(x => x && x.task_id === taskId);
+
+    if (!entry) {
+      entry = {
+        task_id: taskId,
+        mission: mission.name,
+        mission_id: mission.id,
+        cycle: cycleLabel,
+        first_seen: ts,
+        last_seen: ts,
+        status: status || 'open',
+        datetime: rowData.datetime || fmtLocalDateTime(now),
+        isrc: rowData.isrc || '',
+        artist: rowData.artist || '',
+        title: rowData.title || '',
+        raw_data: rowData.raw_data || '',
+        row_testid: rowData.row_testid || null,
+        stable_id: rowData.stable_id || null,
+        events: []
+      };
+      history.push(entry);
+    } else {
+      entry.last_seen = ts;
+      if (status === 'closed') entry.status = 'closed';
+      if (rowData.datetime) entry.datetime = rowData.datetime;
+    }
+
+    if (source) entry.events.push({ ts, source, ...(meta || {}) });
+
+    writeHistory(mission.id, cycleLabel, history);
+
+    // UI Update Logic
+    const closedCount = history.filter(h => h.status === 'closed').length;
+    updateUI(entry, closedCount);
+    logDebug('Logged', mission.id, status, toExportLine(entry));
+  }
+
+  // --- DOM Helpers ---
+  function findClosestRowFromNode(node) {
+    if (!node || !node.closest) return null;
+    return node.closest('[data-testid^="grid-row-"]') || node.closest('.cw-row') || node.closest('[role="row"]');
+  }
+
+  function extractRowSnapshotFromDom(row) {
+    const selectors = ['.c-cell', '[data-testid="grid-cell"]', '[role="gridcell"]'];
+    const cells = row.querySelectorAll(selectors.join(', '));
+    if (!cells || cells.length === 0) return null;
+    const values = [];
+    cells.forEach(cell => { const t = (cell.innerText || '').replace(/\s+/g, ' ').trim(); if (t) values.push(t); });
+    if (values.length === 0) return null;
+    const fields = parseFieldsFromValues(values, fmtLocalDateTime(new Date()));
+    return {
+      primary_text: fields.isrc || values[0] || 'Unknown Task',
+      raw_data: values.join(' | '),
+      values,
+      row_testid: row.getAttribute('data-testid') || null,
+      datetime: fields.datetime,
+      isrc: fields.isrc,
+      artist: fields.artist,
+      title: fields.title
+    };
+  }
+
+  function isCloseTaskClick(target) {
+    if (!currentMission || !currentMission.closeTask) return false;
+
+    // Only consider real button clicks (prevents "peeking" from being interpreted as done)
+    const btn = target.closest('button,[role="button"]');
+    if (!btn) return false;
+
+    const cfg = currentMission.closeTask;
+    const text = (btn.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const oid = (btn.getAttribute) ? (btn.getAttribute('data-object-id') || '') : '';
+
+    // Prefer explicit object-id prefixes when configured
+    if (cfg.objectIdPrefix && oid.startsWith(cfg.objectIdPrefix)) return true;
+
+    // Strictly match the Close button text (do NOT treat "Clear Task" as done)
+    if (text === 'close task' || text.includes('close task')) return true;
+
+    // Backwards compatibility: require BOTH config hint and actual button text to indicate "close task"
+    const lt = (cfg.labelText || '').toLowerCase();
+    const st = (cfg.secondaryText || '').toLowerCase();
+    if (lt.includes('close task') && text.includes('close task')) return true;
+    if (st.includes('close task') && text.includes('close task')) return true;
+
+    return false;
+  }
+
+
+  function handleClick(event) {
+    if (!currentMission) return;
+    const target = event.target;
     if (!target) return;
 
-    // console.log('[Coda Logger] Click detected. Target:', target); // <-- Optional: very noisy
-
-    const button = target.closest('button, [role="button"], [data-testid="canvas-view-row-action"], [data-testid="task-action-button"]');
-    if (!button) {
-      // This is normal, happens on every click that isn't a button
-      return;
+    // Snapshot
+    const row = findClosestRowFromNode(target);
+    if (row) {
+      const snap = extractRowSnapshotFromDom(row);
+      if (snap) {
+        lastRowSnapshot = snap;
+        updateSnapshotIndicator(true);
+      }
     }
 
-    console.log('[Coda Logger] Found a potential button:', button);
-    const text = normaliseWhitespace(button.innerText || button.textContent || '').toLowerCase();
-      console.log("TEXT FOUND:", text);
-
-    if (text.includes('close') && text.includes('task')) {
-    console.log('[Coda Logger] "Close task" button confirmed.');
-    logTask(button, 'close');
-}
-  }
-
-  // ---------- UI Button ----------
-  function createDownloadButton() {
-    if (!isTopLevelContext()) {
-      return;
-    }
-
-    const existing = document.querySelector('[data-coda-task-logger="download"]');
-    if (existing) return;
-
-    const btn = document.createElement('button');
-    btn.textContent = '📄 Download Log';
-    btn.dataset.codaTaskLogger = 'download';
-    Object.assign(btn.style, {
-      position: 'fixed',
-      bottom: '20px',
-      right: '20px',
-      background: '#1a73e8',
-      color: '#fff',
-      border: 'none',
-      borderRadius: '8px',
-      padding: '10px 16px',
-      fontSize: '14px',
-      fontWeight: '600',
-      cursor: 'pointer',
-      boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
-      zIndex: 999999,
-    });
-    btn.addEventListener('click', downloadLog);
-    document.body.appendChild(btn);
-  }
-
-  function startLogger() {
-    initializeFrameBridging();
-
-    // 🔥 Force attach to all iframes (Coda table lives inside deep iframe)
-    setInterval(() => {
-      document.querySelectorAll('iframe').forEach(iframe => {
-        try {
-          const doc = iframe.contentDocument || iframe.contentWindow?.document;
-          if (!doc) return;
-
-          attachClickListener(doc, 'forced-iframe');
-          observeDocumentForIframes(doc);
-        } catch (err) {}
+    // Close Action
+    if (isCloseTaskClick(target)) {
+      if (!lastRowSnapshot) {
+        updateStatusLine('⚠️ Close clicked, but no row snapshot!');
+        return;
+      }
+      upsertTask({
+        mission: currentMission,
+        rowData: lastRowSnapshot,
+        status: 'closed',
+        source: 'close_task_click',
+        meta: { action: 'close_task' }
       });
-    }, 1000);
-
-    if (isTopLevelContext()) {
-      setTimeout(createDownloadButton, 2000);
+      return;
     }
   }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', startLogger);
-  } else {
-    startLogger();
+  // --- Drag & Drop Logic ---
+  function makeDraggable(el) {
+      const header = document.getElementById(el.id + "-header");
+      if (!header) return;
+
+      let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
+
+      header.onmousedown = dragMouseDown;
+
+      function dragMouseDown(e) {
+          e = e || window.event;
+          e.preventDefault();
+          pos3 = e.clientX;
+          pos4 = e.clientY;
+          document.onmouseup = closeDragElement;
+          document.onmousemove = elementDrag;
+      }
+
+      function elementDrag(e) {
+          e = e || window.event;
+          e.preventDefault();
+          // Calculate new position
+          pos1 = pos3 - e.clientX;
+          pos2 = pos4 - e.clientY;
+          pos3 = e.clientX;
+          pos4 = e.clientY;
+
+          const newTop = (el.offsetTop - pos2);
+          const newLeft = (el.offsetLeft - pos1);
+
+          el.style.top = newTop + "px";
+          el.style.left = newLeft + "px";
+          el.style.bottom = 'auto'; // Disable bottom once dragged
+          el.style.right = 'auto';  // Disable right once dragged
+      }
+
+      function closeDragElement() {
+          document.onmouseup = null;
+          document.onmousemove = null;
+          // Save position
+          const pos = { top: el.style.top, left: el.style.left };
+          localStorage.setItem(CONFIG.storageKeys.posKey, JSON.stringify(pos));
+      }
   }
 
-  window.addEventListener('load', () => {
-    initializeFrameBridging();
+  function loadSavedPosition(el) {
+      const saved = safeJsonParse(localStorage.getItem(CONFIG.storageKeys.posKey), null);
+      if (saved && saved.top && saved.left) {
+          el.style.top = saved.top;
+          el.style.left = saved.left;
+          el.style.bottom = 'auto';
+          el.style.right = 'auto';
+      } else {
+          // Default: Upper-Left (Safe zone, away from Watchdog)
+          el.style.top = '120px';
+          el.style.left = '20px';
+          el.style.bottom = 'auto';
+          el.style.right = 'auto';
+      }
+  }
 
-    if (isTopLevelContext()) {
-      createDownloadButton();
+  // --- UI Construction ---
+  function createDock() {
+    if (document.getElementById('coda-tracker-dock')) return;
+
+    const dock = document.createElement('div');
+    dock.id = 'coda-tracker-dock';
+    Object.assign(dock.style, {
+      position: 'fixed',
+      width: '320px',
+      backgroundColor: CONFIG.ui.theme.bg,
+      color: CONFIG.ui.theme.text,
+      border: `2px solid ${CONFIG.ui.theme.border}`,
+      borderRadius: '8px',
+      zIndex: '99999',
+      fontFamily: 'monospace',
+      boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+      overflow: 'hidden',
+      transition: 'width 0.2s ease'
+    });
+
+    // Load Position
+    loadSavedPosition(dock);
+
+    // HEADER
+    const header = document.createElement('div');
+    header.id = 'coda-tracker-dock-header'; // ID for drag handler
+    header.style.cssText = `background:${CONFIG.ui.theme.header}; padding: 8px 10px; border-bottom:1px solid #333; display:flex; justify-content:space-between; align-items:center; cursor:move; user-select:none;`;
+
+    // Prevent minimization when clicking, handle via button explicitly to separate drag/click
+    const titleDiv = document.createElement('div');
+    titleDiv.id = 'coda-tracker-title';
+    titleDiv.style.fontWeight = 'bold';
+    titleDiv.style.fontSize = '13px';
+    titleDiv.innerHTML = `${currentMission ? currentMission.name : 'Waiting...'}`;
+
+    const toggleBtn = document.createElement('span');
+    toggleBtn.id = 'coda-tracker-toggle';
+    toggleBtn.innerText = '[-]';
+    toggleBtn.style.color = '#fff';
+    toggleBtn.style.cursor = 'pointer';
+    toggleBtn.style.padding = '0 5px';
+    toggleBtn.onclick = (e) => {
+        e.stopPropagation(); // Stop drag from triggering
+        toggleCollapse();
+    };
+
+    const controls = document.createElement('div');
+    controls.style.display = 'flex';
+    controls.style.alignItems = 'center';
+    controls.style.gap = '6px';
+
+    function makeCtl(label, tooltip, onClick) {
+      const b = document.createElement('span');
+      b.innerText = label;
+      b.title = tooltip;
+      b.style.cursor = 'pointer';
+      b.style.padding = '2px 6px';
+      b.style.border = '1px solid rgba(255,255,255,0.25)';
+      b.style.borderRadius = '6px';
+      b.style.fontSize = '12px';
+      b.style.userSelect = 'none';
+      b.style.background = 'rgba(0,0,0,0.15)';
+      b.onclick = (e) => { e.stopPropagation(); onClick(); };
+      return b;
     }
-  });
 
-    // ---------- CLEAR LOGS & NEW WEEK BUTTONS ----------
-function clearCurrentLogs() {
-  const context = getActiveLogContext();
+    const decBtn = makeCtl('−', 'Decrement Done count (non-destructive)', () => adjustDoneCount(-1));
+    const incBtn = makeCtl('+', 'Increment Done count (manual)', () => adjustDoneCount(1));
+    const rstBtn = makeCtl('WIPE', 'Permanently delete logs for this cycle', () => wipeLogs());
 
-  // Remove current log data
-  writeStorage(context.logKey, '[]');
+    controls.appendChild(decBtn);
+    controls.appendChild(incBtn);
+    controls.appendChild(rstBtn);
+    controls.appendChild(toggleBtn);
 
-  // Optional: also reset saved window state
-  writeStorage(WINDOW_STATE_KEY, '');
+    header.appendChild(titleDiv);
+    header.appendChild(controls);
 
-  alert(`✔️ Cleared logs for: ${context.fileName}`);
-}
+    // BODY CONTAINER
+    const body = document.createElement('div');
+    body.id = 'coda-tracker-body';
+    body.style.padding = '10px';
+    body.style.display = 'block';
 
-function startNewWeekLogs() {
-  const now = new Date();
+    const status = document.createElement('div');
+    status.id = 'coda-tracker-status';
+    status.style.fontSize = '12px'; status.style.marginBottom = '6px';
+    status.innerText = 'Ready.';
 
-  // 1️⃣ Get current cycle boundaries for "now"
-  const { end: currentCycleEnd } = getCurrentNMFWindow(now);
+    const snapshot = document.createElement('div');
+    snapshot.id = 'coda-tracker-snapshot';
+    snapshot.style.fontSize = '12px'; snapshot.style.marginBottom = '8px';
+    snapshot.innerText = 'Snapshot: no';
 
-  // 2️⃣ The next cycle begins EXACTLY at the "end" timestamp
-  const nextCycleStart = new Date(currentCycleEnd);
+    const content = document.createElement('div');
+    content.id = 'coda-tracker-content';
+    content.style.fontSize = '11px'; content.style.marginBottom = '10px';
+    content.style.lineHeight = '1.4';
+    content.innerText = 'No closed tasks yet.';
 
-  // 3️⃣ File name = Friday immediately after cycle start
-  const friday = new Date(nextCycleStart);
-  friday.setDate(nextCycleStart.getDate() + 1); // Always +1 day for Friday
+    const btnContainer = document.createElement('div');
+    btnContainer.style.display = 'flex'; btnContainer.style.gap = '5px';
 
-  const day = String(friday.getDate()).padStart(2, '0');
-  const monthFormatter = new Intl.DateTimeFormat('en-US', { month: 'short' });
-  const month = monthFormatter.format(friday);
+    const btnTxt = document.createElement('button');
+    btnTxt.innerText = 'TXT';
+    btnTxt.style.cssText = 'flex:1; background:#1a73e8; color:white; border:none; padding:5px; cursor:pointer; border-radius:4px;';
+    btnTxt.onclick = downloadTxt;
 
-  const fileName = `NMF-${day}${month}`;
-  const logKey = `${LOG_KEY_PREFIX}${fileName}`;
+    const btnJson = document.createElement('button');
+    btnJson.innerText = 'JSON';
+    btnJson.style.cssText = 'flex:1; background:#163d7a; color:white; border:none; padding:5px; cursor:pointer; border-radius:4px;';
+    btnJson.onclick = downloadJson;
 
-  // 4️⃣ Compute next cycle end = 7 days after start
-  const nextCycleEnd = new Date(nextCycleStart);
-  nextCycleEnd.setDate(nextCycleStart.getDate() + 7);
+    btnContainer.appendChild(btnTxt);
+    btnContainer.appendChild(btnJson);
 
-  // 5️⃣ Reset storage for new week
-  writeStorage(logKey, '[]');
-  writeStorage(
-    WINDOW_STATE_KEY,
-    JSON.stringify({
-      start: nextCycleStart.toISOString(),
-      end: nextCycleEnd.toISOString(),
-      fileName,
-      logKey,
-    })
-  );
+    body.appendChild(status);
+    body.appendChild(snapshot);
+    body.appendChild(content);
+    body.appendChild(btnContainer);
 
-  alert(`🆕 Started new week log: ${fileName}`);
-}
+    dock.appendChild(header);
+    dock.appendChild(body);
+    document.body.appendChild(dock);
 
-function createUtilityButtons() {
-  if (!isTopLevelContext()) return;
+    makeDraggable(dock);
 
-  // Prevent duplication
-  if (document.querySelector('[data-coda-task-logger="clear"]')) return;
+    refreshStatus();
+    loadInitialCount();
+  }
 
-  // --- Clear Logs Button ---
-  const clearBtn = document.createElement('button');
-  clearBtn.textContent = '🗑 Clear Logs';
-  clearBtn.dataset.codaTaskLogger = 'clear';
-  Object.assign(clearBtn.style, {
-    position: 'fixed',
-    bottom: '60px',
-    right: '20px',
-    background: '#d93025',
-    color: '#fff',
-    border: 'none',
-    borderRadius: '8px',
-    padding: '10px 16px',
-    fontSize: '14px',
-    fontWeight: '600',
-    cursor: 'pointer',
-    boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
-    zIndex: 999999,
-  });
-  clearBtn.addEventListener('click', clearCurrentLogs);
-  document.body.appendChild(clearBtn);
+  function toggleCollapse() {
+    isDockCollapsed = !isDockCollapsed;
+    const body = document.getElementById('coda-tracker-body');
+    const toggle = document.getElementById('coda-tracker-toggle');
+    const dock = document.getElementById('coda-tracker-dock');
 
-  // --- Start New Week Button ---
-  const newWeekBtn = document.createElement('button');
-  newWeekBtn.textContent = '🆕 New Week';
-  newWeekBtn.dataset.codaTaskLogger = 'newweek';
-  Object.assign(newWeekBtn.style, {
-    position: 'fixed',
-    bottom: '100px',
-    right: '20px',
-    background: '#34a853',
-    color: '#fff',
-    border: 'none',
-    borderRadius: '8px',
-    padding: '10px 16px',
-    fontSize: '14px',
-    fontWeight: '600',
-    cursor: 'pointer',
-    boxShadow: '0 2px 6px rgba(0,0,0,0.2)',
-    zIndex: 999999,
-  });
-  newWeekBtn.addEventListener('click', startNewWeekLogs);
-  document.body.appendChild(newWeekBtn);
-}
+    if (isDockCollapsed) {
+      body.style.display = 'none';
+      toggle.innerText = '[+]';
+      dock.style.width = '200px';
+    } else {
+      body.style.display = 'block';
+      toggle.innerText = '[-]';
+      dock.style.width = '320px';
+    }
+  }
 
-// Call them together with download button creator
-if (isTopLevelContext()) {
-  setTimeout(() => {
-    createDownloadButton();
-    createUtilityButtons();
-  }, 2000);
-}
+  function loadInitialCount() {
+    if (!currentMission) return;
+    const cycle = getCycleLabel(currentMission, new Date());
+    const hist = readHistory(currentMission.id, cycle);
+    const closed = hist.filter(h => h.status === 'closed').length;
+    const last = hist.length > 0 ? hist[hist.length - 1] : null;
+    if (last) updateUI(last, closed);
+    else updateUI({ status: 'waiting' }, 0);
+  }
 
+  function updateUI(lastEntry, closedCount) {
+    const titleDiv = document.getElementById('coda-tracker-title');
+    const content = document.getElementById('coda-tracker-content');
+
+    if (titleDiv) {
+        titleDiv.innerHTML = `${currentMission.id === 'nmf' ? 'NMF' : 'Mission'}: <span style="color:#55ff55">${closedCount} Done</span>`;
+    }
+
+    if (content) {
+      if (!lastEntry || lastEntry.status === 'waiting') {
+        content.innerHTML = `This cycle: <b>${closedCount}</b> completed.`;
+      } else {
+        const line = toExportLine(lastEntry);
+        const color = lastEntry.status === 'closed' ? '#55ff55' : '#aaa';
+        content.innerHTML = `
+          <div style="margin-bottom:4px; color:${color}">Last Action: ${lastEntry.status.toUpperCase()}</div>
+          <div style="opacity:0.8; margin-bottom:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${line}</div>
+          <div style="border-top:1px solid #333; padding-top:4px;">Total Completed: <b style="font-size:14px; color:#fff">${closedCount}</b></div>
+        `;
+      }
+    }
+  }
+
+  function updateSnapshotIndicator(has) {
+    const el = document.getElementById('coda-tracker-snapshot');
+    if (el) {
+        el.innerHTML = `Snapshot: <span style="color:${has ? '#55ff55' : '#ff5555'}">${has ? 'READY' : 'Waiting...'}</span>`;
+    }
+  }
+
+  function updateStatusLine(text) {
+      const el = document.getElementById('coda-tracker-status');
+      if (el) el.innerText = text;
+  }
+
+  function refreshStatus() {
+    if (!currentMission) return;
+    const cycle = getCycleLabel(currentMission, new Date());
+    updateStatusLine(`Cycle: ${cycle}`);
+  }
+
+  function downloadTxt() {
+    if (!currentMission) return;
+    const cycleLabel = getCycleLabel(currentMission, new Date());
+    const history = readHistory(currentMission.id, cycleLabel);
+    const lines = history.map(e => `${e.status.toUpperCase()}: ${toExportLine(e)}`).join('\n');
+    const blob = new Blob([lines], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `${currentMission.id}_${cycleLabel}.txt`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function downloadJson() {
+    if (!currentMission) return;
+    const cycleLabel = getCycleLabel(currentMission, new Date());
+    const data = localStorage.getItem(storageKey(currentMission.id, cycleLabel));
+    const blob = new Blob([data], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `${currentMission.id}_${cycleLabel}.json`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function onRouteChange() {
+    currentMission = detectMission();
+    createDock();
+    refreshStatus();
+    loadInitialCount();
+  }
+
+  function init() {
+    currentMission = detectMission();
+    const _pushState = history.pushState;
+    history.pushState = function () { const ret = _pushState.apply(this, arguments); setTimeout(onRouteChange, 0); return ret; };
+    const _replaceState = history.replaceState;
+    history.replaceState = function () { const ret = _replaceState.apply(this, arguments); setTimeout(onRouteChange, 0); return ret; };
+    window.addEventListener('popstate', () => setTimeout(onRouteChange, 0));
+    document.addEventListener('click', handleClick, true);
+    if (currentMission) {
+      createDock();
+      refreshStatus();
+      loadInitialCount();
+    }
+  }
+
+  setTimeout(init, 1500);
 })();
