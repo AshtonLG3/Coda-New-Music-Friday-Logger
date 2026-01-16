@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Coda Task Logger",
+  "version": "5.0.4",
+  "description": "Logs Coda tasks with a Navy & Gold draggable dock, hard wipe, manual counters, and TXT export.",
+  "permissions": [],
+  "host_permissions": [
+    "https://coda.io/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://coda.io/*"],
+      "js": ["content.js"],
+      "run_at": "document_end",
+      "all_frames": false
+    }
+  ],
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}

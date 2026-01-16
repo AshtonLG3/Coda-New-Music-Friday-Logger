@@ -1,0 +1,902 @@
+(function () {
+  'use strict';
+
+  const DEBUG = true;
+
+  const CONFIG = {
+    missions: {
+      nmf: {
+        id: 'nmf',
+        urlSignature: '_suqO9aln',
+        name: 'New Music Friday',
+        cycle: { anchorDow: 4, anchorHour: 15, anchorMinute: 0 },
+        cycleLabelMode: 'friday_of_cycle',
+        closeTask: {
+          labelText: 'Close Task',
+          secondaryText: 'Close task',
+          svgHint: 'task-completed.svg'
+        },
+        rowDataUrlHints: []
+      },
+      apple_sprint: {
+        id: 'apple_sprint',
+        urlSignature: '_suR3dVuO',
+        name: 'Apple Coda Sprint',
+        thursdayOnly: false,
+        closeTask: {
+          labelText: 'Close task',
+          objectIdPrefix: 'grid-sync-1054',
+          svgHint: 'task-completed.svg'
+        },
+        cycleLabelMode: 'today',
+        rowDataUrlHints: []
+      }
+    },
+
+    storageKeys: {
+      logPrefix: 'coda_task_log::',
+      posKey: 'coda_tracker_pos' // Stores {top, left}
+    },
+
+    ui: {
+      theme: {
+        bg: '#0b1f33',
+        text: '#f5c77a',
+        border: '#1a73e8',
+        header: '#081624'
+      }
+    },
+
+    network: {
+      enable: true,
+      allowedHosts: ['coda.io', 'www.coda.io', 'codacontent.io', 'codahosted.io', 'cdn.coda.io']
+    },
+
+    isrcRegex: /\b[A-Z]{2}[A-Z0-9]{3}\d{7}\b/,
+    snapshotThrottleMs: 200
+  };
+
+  let currentMission = null;
+  let clickListenerInstalled = false;
+  let pointerListenerInstalled = false;
+  let routeHooksInstalled = false;
+  let networkInstalled = false;
+  let isDockCollapsed = false;
+
+  let lastRowSnapshot = null;
+  let lastSnapshotAt = 0;
+
+  function logDebug(...args) {
+    if (!DEBUG) return;
+    console.log('[CodaTracker]', ...args);
+  }
+
+  // --- Date Helpers ---
+  function pad2(n) { return String(n).padStart(2, '0'); }
+  function fmtYmd(d) { return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; }
+  function fmtLocalDateTime(d) { return `${fmtYmd(d)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`; }
+  function startOfDay(d) { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; }
+  function addDays(d, days) { const x = new Date(d); x.setDate(x.getDate() + days); return x; }
+  function safeJsonParse(str, fallback) { try { return JSON.parse(str); } catch { return fallback; } }
+  function stableHash(str) {
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = (h * 16777619) >>> 0; }
+    return h.toString(16);
+  }
+
+  // --- Mission Logic ---
+  function detectMission() {
+    const url = location.href;
+    for (const k in CONFIG.missions) {
+      const m = CONFIG.missions[k];
+      if (m.urlSignature && url.includes(m.urlSignature)) return m;
+    }
+    return null;
+  }
+
+  function getNmfCycle(now = new Date()) {
+    const c = CONFIG.missions.nmf.cycle;
+    const d = new Date(now);
+    const day = d.getDay();
+    const diff = (day + 7 - c.anchorDow) % 7;
+    const anchor = new Date(d);
+    anchor.setDate(d.getDate() - diff);
+    anchor.setHours(c.anchorHour, c.anchorMinute, 0, 0);
+    const end = addDays(anchor, 7);
+    return { anchor, end };
+  }
+
+  function nmfCycleLabel(now = new Date()) {
+    const { anchor } = getNmfCycle(now);
+    const friday = addDays(startOfDay(anchor), 1);
+    return fmtYmd(friday);
+  }
+
+  function appleCycleLabel(now = new Date()) { return fmtYmd(startOfDay(now)); }
+  function getCycleLabel(mission, now = new Date()) {
+    if (!mission) return fmtYmd(now);
+    if (mission.id === 'nmf') return nmfCycleLabel(now);
+    if (mission.id === 'apple_sprint') return appleCycleLabel(now);
+    return fmtYmd(now);
+  }
+
+  function isMissionActive(mission, now = new Date()) {
+    if (!mission) return false;
+    if (mission.id === 'nmf') {
+      const { anchor, end } = getNmfCycle(now);
+      return now >= anchor && now < end;
+    }
+    return true;
+  }
+
+  // --- Storage ---
+  function storageKey(missionId, cycleLabel) { return `${CONFIG.storageKeys.logPrefix}${missionId}::${cycleLabel}`; }
+  function readHistory(missionId, cycleLabel) { return safeJsonParse(localStorage.getItem(storageKey(missionId, cycleLabel)) || '[]', []); }
+  function writeHistory(missionId, cycleLabel, history) { localStorage.setItem(storageKey(missionId, cycleLabel), JSON.stringify(history)); }
+
+  // --- Manual Done Count Controls ---
+
+  function getCurrentHistoryBundle() {
+    if (!currentMission) return null;
+    const cycleLabel = getCycleLabel(currentMission, new Date());
+    const history = readHistory(currentMission.id, cycleLabel);
+    return { cycleLabel, history };
+  }
+
+  function persistHistoryAndRefresh(cycleLabel, history) {
+    writeHistory(currentMission.id, cycleLabel, history);
+    const closedCount = history.filter(h => h.status === 'closed').length;
+    const last = history.length > 0 ? history[history.length - 1] : null;
+    if (last) updateUI(last, closedCount);
+    else updateUI({ status: 'waiting' }, 0);
+  }
+
+  function wipeLogs() {
+    if (!currentMission) return;
+
+    if (!confirm("⚠️ DELETE ALL LOGS? ⚠️\n\nThis will permanently delete the TXT records for this cycle.\nUse this to remove false captures.\n\nConfirm?")) return;
+
+    const cycleLabel = getCycleLabel(currentMission, new Date());
+    const key = storageKey(currentMission.id, cycleLabel);
+
+    // Physically remove the key from storage
+    localStorage.removeItem(key);
+
+    // Refresh UI
+    loadInitialCount();
+    refreshStatus();
+    updateStatusLine('Cycle logs wiped.');
+  }
+
+  function adjustDoneCount(delta) {
+    const bundle = getCurrentHistoryBundle();
+    if (!bundle) return;
+    const { cycleLabel, history } = bundle;
+
+    const steps = Math.abs(delta);
+    let changed = 0;
+
+    if (delta < 0) {
+      for (let i = 0; i < steps; i++) {
+        let idx = -1;
+        for (let j = history.length - 1; j >= 0; j--) {
+          if (history[j].status === 'closed') { idx = j; break; }
+        }
+        if (idx === -1) break;
+        history[idx].status = 'open';
+        history[idx].manual_adjust = 'dec';
+        history[idx].manual_adjust_at = new Date().toISOString();
+        changed++;
+      }
+    } else if (delta > 0) {
+      for (let i = 0; i < steps; i++) {
+        let idx = -1;
+        for (let j = history.length - 1; j >= 0; j--) {
+          if (history[j].status !== 'closed') { idx = j; break; }
+        }
+        if (idx !== -1) {
+          history[idx].status = 'closed';
+          history[idx].manual_adjust = 'inc';
+          history[idx].manual_adjust_at = new Date().toISOString();
+          changed++;
+        } else {
+          // If everything is already closed (or history is empty), add a manual entry
+          history.push({
+            ts: new Date().toISOString(),
+            status: 'closed',
+            source: 'manual_inc',
+            last_seen: Date.now(),
+            datetime: fmtLocalDateTime(new Date()),
+            title: 'Manual count increment',
+            manual_adjust: 'inc'
+          });
+          changed++;
+        }
+      }
+    }
+
+    persistHistoryAndRefresh(cycleLabel, history);
+    logDebug(`[Manual] Adjust Done count by ${delta}: applied ${changed}`);
+  }
+
+
+  function computeTaskId(missionId, rowData) {
+    if (rowData.stable_id) return `${missionId}::${rowData.stable_id}`;
+    if (rowData.row_testid) return `${missionId}::${rowData.row_testid}`;
+    if (rowData.isrc) return `${missionId}::isrc:${rowData.isrc}`;
+    return `${missionId}::h:${stableHash((rowData.primary_text || '') + '||' + (rowData.raw_data || ''))}`;
+  }
+
+  // --- Data Extraction ---
+  function parseFieldsFromValues(values, fallbackDateTimeStr) {
+    const out = { datetime: fallbackDateTimeStr, isrc: '', artist: '', title: '' };
+    if (!Array.isArray(values) || values.length === 0) return out;
+
+    let isrcIndex = -1;
+    for (let i = 0; i < values.length; i++) {
+      const m = String(values[i]).match(CONFIG.isrcRegex);
+      if (m) { out.isrc = m[0]; isrcIndex = i; break; }
+    }
+
+    const dtRegex = /^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$/;
+    if (isrcIndex > 0) {
+      const prev = String(values[isrcIndex - 1]).trim();
+      if (dtRegex.test(prev)) out.datetime = prev;
+    }
+
+    const cleaned = values.map(v => String(v).trim()).filter(v => v && !dtRegex.test(v) && !(CONFIG.isrcRegex.test(v)));
+
+    if (isrcIndex >= 0) {
+      const artistCandidate = (values[isrcIndex + 1] != null) ? String(values[isrcIndex + 1]).trim() : '';
+      const titleCandidate = (values[isrcIndex + 2] != null) ? String(values[isrcIndex + 2]).trim() : '';
+      if (artistCandidate) out.artist = artistCandidate.replaceAll('_', ' ');
+      if (titleCandidate) out.title = titleCandidate.replaceAll('_', ' ');
+      if (!out.artist) out.artist = (cleaned[0] || '').replaceAll('_', ' ');
+      if (!out.title) out.title = (cleaned[1] || '').replaceAll('_', ' ');
+    } else {
+      out.artist = (cleaned[0] || '').replaceAll('_', ' ');
+      out.title = (cleaned[1] || '').replaceAll('_', ' ');
+    }
+    return out;
+  }
+
+  function toExportLine(entry) {
+    const dt = entry.datetime || fmtLocalDateTime(new Date(entry.last_seen || Date.now()));
+    return [dt, entry.isrc || '', entry.artist || '', entry.title || ''].filter(Boolean).join(' ').trim();
+  }
+
+  function upsertTask({ mission, rowData, status, source, meta }) {
+    const now = new Date();
+    const cycleLabel = getCycleLabel(mission, now);
+    const history = readHistory(mission.id, cycleLabel);
+
+    const ts = now.toISOString();
+    const taskId = computeTaskId(mission.id, rowData);
+    let entry = history.find(x => x && x.task_id === taskId);
+
+    if (!entry) {
+      entry = {
+        task_id: taskId,
+        mission: mission.name,
+        mission_id: mission.id,
+        cycle: cycleLabel,
+        first_seen: ts,
+        last_seen: ts,
+        status: status || 'open',
+        datetime: rowData.datetime || fmtLocalDateTime(now),
+        isrc: rowData.isrc || '',
+        artist: rowData.artist || '',
+        title: rowData.title || '',
+        raw_data: rowData.raw_data || '',
+        row_testid: rowData.row_testid || null,
+        stable_id: rowData.stable_id || null,
+        events: []
+      };
+      history.push(entry);
+    } else {
+      entry.last_seen = ts;
+      if (status === 'closed') entry.status = 'closed';
+      if (rowData.datetime) entry.datetime = rowData.datetime;
+    }
+
+    if (source) entry.events.push({ ts, source, ...(meta || {}) });
+
+    writeHistory(mission.id, cycleLabel, history);
+
+    // UI Update Logic
+    const closedCount = history.filter(h => h.status === 'closed').length;
+    updateUI(entry, closedCount);
+    logDebug('Logged', mission.id, status, toExportLine(entry));
+  }
+
+  // --- Network Interception ---
+  function isHostAllowed(url) {
+    try {
+      const u = new URL(url, location.href);
+      return CONFIG.network.allowedHosts.includes(u.hostname);
+    } catch {
+      return false;
+    }
+  }
+
+  function looksLikeRowDataUrl(url) {
+    return /rows|tables|views|grid/i.test(url);
+  }
+
+  function urlMatchesAny(url, hints) {
+    if (!hints || hints.length === 0) return true;
+    return hints.some(h => url.includes(h));
+  }
+
+  function extractReadableStrings(obj, limit = 16) {
+    const out = [];
+    const seen = new Set();
+    function pushStr(s) {
+      if (s == null) return;
+      const t = String(s).trim();
+      if (!t) return;
+      if (t.length > 220) return;
+      if (seen.has(t)) return;
+      seen.add(t);
+      out.push(t);
+    }
+    function walk(x) {
+      if (out.length >= limit) return;
+      if (x == null) return;
+      if (typeof x === 'string' || typeof x === 'number' || typeof x === 'boolean') {
+        pushStr(x);
+        return;
+      }
+      if (Array.isArray(x)) {
+        for (const it of x) {
+          if (out.length >= limit) break;
+          walk(it);
+        }
+        return;
+      }
+      if (typeof x === 'object') {
+        const preferred = ['isrc', 'artist', 'title', 'track', 'name', 'id', 'value', 'text', 'display'];
+        for (const k of preferred) {
+          if (out.length >= limit) break;
+          if (Object.prototype.hasOwnProperty.call(x, k)) walk(x[k]);
+        }
+        for (const k in x) {
+          if (out.length >= limit) break;
+          if (preferred.includes(k)) continue;
+          walk(x[k]);
+        }
+      }
+    }
+    walk(obj);
+    return out;
+  }
+
+  function findRowArrays(json) {
+    const candidates = [];
+    function walk(x) {
+      if (!x) return;
+      if (Array.isArray(x)) {
+        if (x.length > 0 && typeof x[0] === 'object' && x[0] !== null) {
+          const hasId = x.some(o => o && typeof o === 'object' && ('id' in o || 'rowId' in o || 'row_id' in o));
+          if (hasId) candidates.push(x);
+        }
+        for (const it of x) walk(it);
+        return;
+      }
+      if (typeof x === 'object') {
+        for (const k in x) walk(x[k]);
+      }
+    }
+    walk(json);
+    candidates.sort((a, b) => (b.length || 0) - (a.length || 0));
+    return candidates[0] || null;
+  }
+
+  function handleNetworkRows(url, json) {
+    if (!currentMission) return;
+
+    const rows = findRowArrays(json);
+    if (!rows || rows.length === 0) return;
+
+    for (const r of rows) {
+      if (!r || typeof r !== 'object') continue;
+      const rid = r.id || r.rowId || r.row_id || null;
+
+      const values = extractReadableStrings(r, 16);
+      const raw = values.join(' | ');
+      const fields = parseFieldsFromValues(values, fmtLocalDateTime(new Date()));
+
+      if (!fields.isrc && !fields.artist && !fields.title) continue;
+
+      upsertTask({
+        mission: currentMission,
+        rowData: {
+          stable_id: rid ? `row:${rid}` : null,
+          raw_data: raw,
+          primary_text: fields.isrc || values[0] || (rid ? String(rid) : 'Row'),
+          datetime: fields.datetime,
+          isrc: fields.isrc,
+          artist: fields.artist,
+          title: fields.title
+        },
+        status: 'open',
+        source: 'network_rows',
+        meta: { url }
+      });
+    }
+  }
+
+  function installNetworkInterceptorsOnce() {
+    if (networkInstalled) return;
+    if (!CONFIG.network.enable) return;
+    networkInstalled = true;
+
+    const originalFetch = window.fetch;
+    window.fetch = async function (...args) {
+      const res = await originalFetch.apply(this, args);
+      try {
+        if (!currentMission) return res;
+
+        const url = (typeof args[0] === 'string') ? args[0] : (args[0] && args[0].url) ? args[0].url : '';
+        if (!url || !isHostAllowed(url)) return res;
+
+        const ct = (res.headers.get('content-type') || '').toLowerCase();
+        if (!ct.includes('json')) return res;
+
+        const isRow = looksLikeRowDataUrl(url) && urlMatchesAny(url, currentMission.rowDataUrlHints);
+        if (!isRow) return res;
+
+        const clone = res.clone();
+        const json = await clone.json().catch(() => null);
+        if (!json) return res;
+
+        handleNetworkRows(url, json);
+      } catch { }
+
+      return res;
+    };
+
+    const OriginalXHR = window.XMLHttpRequest;
+    function PatchedXHR() {
+      const xhr = new OriginalXHR();
+      let requestUrl = '';
+
+      const origOpen = xhr.open;
+      xhr.open = function (method, url) {
+        requestUrl = url;
+        return origOpen.apply(xhr, arguments);
+      };
+
+      const origSend = xhr.send;
+      xhr.send = function () {
+        xhr.addEventListener('load', function () {
+          try {
+            if (!currentMission) return;
+            if (!requestUrl || !isHostAllowed(requestUrl)) return;
+
+            const isRow = looksLikeRowDataUrl(requestUrl) && urlMatchesAny(requestUrl, currentMission.rowDataUrlHints);
+            if (!isRow) return;
+
+            const text = xhr.responseText;
+            if (!text || text.length < 2) return;
+
+            const json = safeJsonParse(text, null);
+            if (!json) return;
+
+            handleNetworkRows(requestUrl, json);
+          } catch { }
+        });
+
+        return origSend.apply(xhr, arguments);
+      };
+
+      return xhr;
+    }
+    window.XMLHttpRequest = PatchedXHR;
+  }
+
+  // --- DOM Helpers ---
+  function findClosestRowFromNode(node) {
+    if (!node || !node.closest) return null;
+    return node.closest('[data-testid^="grid-row-"]') || node.closest('.cw-row') || node.closest('[role="row"]');
+  }
+
+  function extractRowSnapshotFromDom(row) {
+    const selectors = ['.c-cell', '[data-testid="grid-cell"]', '[role="gridcell"]'];
+    const cells = row.querySelectorAll(selectors.join(', '));
+    if (!cells || cells.length === 0) return null;
+    const values = [];
+    cells.forEach(cell => { const t = (cell.innerText || '').replace(/\s+/g, ' ').trim(); if (t) values.push(t); });
+    if (values.length === 0) return null;
+    const fields = parseFieldsFromValues(values, fmtLocalDateTime(new Date()));
+    return {
+      primary_text: fields.isrc || values[0] || 'Unknown Task',
+      raw_data: values.join(' | '),
+      values,
+      row_testid: row.getAttribute('data-testid') || null,
+      datetime: fields.datetime,
+      isrc: fields.isrc,
+      artist: fields.artist,
+      title: fields.title
+    };
+  }
+
+  function isCloseTaskClick(target) {
+    if (!currentMission || !currentMission.closeTask) return false;
+
+    // Only consider real button clicks
+    const btn = target.closest('button,[role="button"]');
+    if (!btn) return false;
+
+    const cfg = currentMission.closeTask;
+    const text = (btn.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const oid = (btn.getAttribute) ? (btn.getAttribute('data-object-id') || '') : '';
+
+    if (cfg.objectIdPrefix && oid.startsWith(cfg.objectIdPrefix)) return true;
+
+    if (text === 'close task' || text.includes('close task')) return true;
+
+    const lt = (cfg.labelText || '').toLowerCase();
+    const st = (cfg.secondaryText || '').toLowerCase();
+    if (lt.includes('close task') && text.includes('close task')) return true;
+    if (st.includes('close task') && text.includes('close task')) return true;
+
+    return false;
+  }
+
+
+  function handleClick(event) {
+    if (!currentMission) return;
+    const target = event.target;
+    if (!target) return;
+
+    // Snapshot
+    const row = findClosestRowFromNode(target);
+    if (row) {
+      const snap = extractRowSnapshotFromDom(row);
+      if (snap) {
+        lastRowSnapshot = snap;
+        updateSnapshotIndicator(true);
+      }
+    }
+
+    // Close Action
+    if (isCloseTaskClick(target)) {
+      if (!lastRowSnapshot) {
+        updateStatusLine('⚠️ Close clicked, but no row snapshot!');
+        return;
+      }
+      upsertTask({
+        mission: currentMission,
+        rowData: lastRowSnapshot,
+        status: 'closed',
+        source: 'close_task_click',
+        meta: { action: 'close_task' }
+      });
+      return;
+    }
+  }
+
+  // --- Drag & Drop Logic ---
+  function makeDraggable(el) {
+    const header = document.getElementById(el.id + "-header");
+    if (!header) return;
+
+    let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
+
+    header.onmousedown = dragMouseDown;
+
+    function dragMouseDown(e) {
+      e = e || window.event;
+      e.preventDefault();
+      pos3 = e.clientX;
+      pos4 = e.clientY;
+      document.onmouseup = closeDragElement;
+      document.onmousemove = elementDrag;
+    }
+
+    function elementDrag(e) {
+      e = e || window.event;
+      e.preventDefault();
+      // Calculate new position
+      pos1 = pos3 - e.clientX;
+      pos2 = pos4 - e.clientY;
+      pos3 = e.clientX;
+      pos4 = e.clientY;
+
+      const newTop = (el.offsetTop - pos2);
+      const newLeft = (el.offsetLeft - pos1);
+
+      el.style.top = newTop + "px";
+      el.style.left = newLeft + "px";
+      el.style.bottom = 'auto'; // Disable bottom once dragged
+      el.style.right = 'auto'; // Disable right once dragged
+    }
+
+    function closeDragElement() {
+      document.onmouseup = null;
+      document.onmousemove = null;
+      // Save position
+      const pos = { top: el.style.top, left: el.style.left };
+      localStorage.setItem(CONFIG.storageKeys.posKey, JSON.stringify(pos));
+    }
+  }
+
+  function loadSavedPosition(el) {
+    const saved = safeJsonParse(localStorage.getItem(CONFIG.storageKeys.posKey), null);
+    if (saved && saved.top && saved.left) {
+      el.style.top = saved.top;
+      el.style.left = saved.left;
+      el.style.bottom = 'auto';
+      el.style.right = 'auto';
+    } else {
+      // Default: Upper-Left (Safe zone, away from Watchdog)
+      el.style.top = '120px';
+      el.style.left = '20px';
+      el.style.bottom = 'auto';
+      el.style.right = 'auto';
+    }
+  }
+
+  // --- UI Construction ---
+  function createDock() {
+    if (document.getElementById('coda-tracker-dock')) return;
+
+    const dock = document.createElement('div');
+    dock.id = 'coda-tracker-dock';
+    Object.assign(dock.style, {
+      position: 'fixed',
+      width: '320px',
+      backgroundColor: CONFIG.ui.theme.bg,
+      color: CONFIG.ui.theme.text,
+      border: `2px solid ${CONFIG.ui.theme.border}`,
+      borderRadius: '8px',
+      zIndex: '99999',
+      fontFamily: 'monospace',
+      boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
+      overflow: 'hidden',
+      transition: 'width 0.2s ease'
+    });
+
+    // Load Position
+    loadSavedPosition(dock);
+
+    // HEADER
+    const header = document.createElement('div');
+    header.id = 'coda-tracker-dock-header'; // ID for drag handler
+    header.style.cssText = `background:${CONFIG.ui.theme.header}; padding: 8px 10px; border-bottom:1px solid #333; display:flex; justify-content:space-between; align-items:center; cursor:move; user-select:none;`;
+
+    // Prevent minimization when clicking, handle via button explicitly to separate drag/click
+    const titleDiv = document.createElement('div');
+    titleDiv.id = 'coda-tracker-title';
+    titleDiv.style.fontWeight = 'bold';
+    titleDiv.style.fontSize = '13px';
+    titleDiv.innerHTML = `${currentMission ? currentMission.name : 'Waiting...'}`;
+
+    const toggleBtn = document.createElement('span');
+    toggleBtn.id = 'coda-tracker-toggle';
+    toggleBtn.innerText = '[-]';
+    toggleBtn.style.color = '#fff';
+    toggleBtn.style.cursor = 'pointer';
+    toggleBtn.style.padding = '0 5px';
+    toggleBtn.onclick = (e) => {
+      e.stopPropagation(); // Stop drag from triggering
+      toggleCollapse();
+    };
+
+    const controls = document.createElement('div');
+    controls.style.display = 'flex';
+    controls.style.alignItems = 'center';
+    controls.style.gap = '6px';
+
+    function makeCtl(label, tooltip, onClick) {
+      const b = document.createElement('span');
+      b.innerText = label;
+      b.title = tooltip;
+      b.style.cursor = 'pointer';
+      b.style.padding = '2px 6px';
+      b.style.border = '1px solid rgba(255,255,255,0.25)';
+      b.style.borderRadius = '6px';
+      b.style.fontSize = '12px';
+      b.style.userSelect = 'none';
+      b.style.background = 'rgba(0,0,0,0.15)';
+      b.onclick = (e) => { e.stopPropagation(); onClick(); };
+      return b;
+    }
+
+    const decBtn = makeCtl('−', 'Decrement Done count (non-destructive)', () => adjustDoneCount(-1));
+    const incBtn = makeCtl('+', 'Increment Done count (manual)', () => adjustDoneCount(1));
+    const rstBtn = makeCtl('WIPE', 'Permanently delete logs for this cycle', () => wipeLogs());
+
+    controls.appendChild(decBtn);
+    controls.appendChild(incBtn);
+    controls.appendChild(rstBtn);
+    controls.appendChild(toggleBtn);
+
+    header.appendChild(titleDiv);
+    header.appendChild(controls);
+
+    // BODY CONTAINER
+    const body = document.createElement('div');
+    body.id = 'coda-tracker-body';
+    body.style.padding = '10px';
+    body.style.display = 'block';
+
+    const status = document.createElement('div');
+    status.id = 'coda-tracker-status';
+    status.style.fontSize = '12px';
+    status.style.marginBottom = '6px';
+    status.innerText = 'Ready.';
+
+    const snapshot = document.createElement('div');
+    snapshot.id = 'coda-tracker-snapshot';
+    snapshot.style.fontSize = '12px';
+    snapshot.style.marginBottom = '8px';
+    snapshot.innerText = 'Snapshot: no';
+
+    const content = document.createElement('div');
+    content.id = 'coda-tracker-content';
+    content.style.fontSize = '11px';
+    content.style.marginBottom = '10px';
+    content.style.lineHeight = '1.4';
+    content.innerText = 'No closed tasks yet.';
+
+    const btnContainer = document.createElement('div');
+    btnContainer.style.display = 'flex';
+    btnContainer.style.gap = '5px';
+
+    const btnTxt = document.createElement('button');
+    btnTxt.innerText = 'Download Log (TXT)';
+    btnTxt.style.cssText = 'flex:1; background:#1a73e8; color:white; border:none; padding:5px; cursor:pointer; border-radius:4px;';
+    btnTxt.onclick = downloadTxt;
+
+    btnContainer.appendChild(btnTxt);
+
+    body.appendChild(status);
+    body.appendChild(snapshot);
+    body.appendChild(content);
+    body.appendChild(btnContainer);
+
+    dock.appendChild(header);
+    dock.appendChild(body);
+    document.body.appendChild(dock);
+
+    makeDraggable(dock);
+
+    refreshStatus();
+    loadInitialCount();
+  }
+
+  function toggleCollapse() {
+    isDockCollapsed = !isDockCollapsed;
+    const body = document.getElementById('coda-tracker-body');
+    const toggle = document.getElementById('coda-tracker-toggle');
+    const dock = document.getElementById('coda-tracker-dock');
+
+    if (isDockCollapsed) {
+      body.style.display = 'none';
+      toggle.innerText = '[+]';
+      dock.style.width = '200px';
+    } else {
+      body.style.display = 'block';
+      toggle.innerText = '[-]';
+      dock.style.width = '320px';
+    }
+  }
+
+  function loadInitialCount() {
+    if (!currentMission) return;
+    const cycle = getCycleLabel(currentMission, new Date());
+    const hist = readHistory(currentMission.id, cycle);
+    const closed = hist.filter(h => h.status === 'closed').length;
+    const last = hist.length > 0 ? hist[hist.length - 1] : null;
+    if (last) updateUI(last, closed);
+    else updateUI({ status: 'waiting' }, 0);
+  }
+
+  function updateUI(lastEntry, closedCount) {
+    const titleDiv = document.getElementById('coda-tracker-title');
+    const content = document.getElementById('coda-tracker-content');
+
+    if (titleDiv) {
+      titleDiv.innerHTML = `${currentMission.id === 'nmf' ? 'NMF' : 'Mission'}: <span style="color:#55ff55">${closedCount} Done</span>`;
+    }
+
+    if (content) {
+      if (!lastEntry || lastEntry.status === 'waiting') {
+        content.innerHTML = `This cycle: <b>${closedCount}</b> completed.`;
+      } else {
+        const line = toExportLine(lastEntry);
+        const color = lastEntry.status === 'closed' ? '#55ff55' : '#aaa';
+        content.innerHTML = `
+          <div style="margin-bottom:4px; color:${color}">Last Action: ${lastEntry.status.toUpperCase()}</div>
+          <div style="opacity:0.8; margin-bottom:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">${line}</div>
+          <div style="border-top:1px solid #333; padding-top:4px;">Total Completed: <b style="font-size:14px; color:#fff">${closedCount}</b></div>
+        `;
+      }
+    }
+  }
+
+  function updateSnapshotIndicator(has) {
+    const el = document.getElementById('coda-tracker-snapshot');
+    if (el) {
+      el.innerHTML = `Snapshot: <span style="color:${has ? '#55ff55' : '#ff5555'}">${has ? 'READY' : 'Waiting...'}</span>`;
+    }
+  }
+
+  function updateStatusLine(text) {
+    const el = document.getElementById('coda-tracker-status');
+    if (el) el.innerText = text;
+  }
+
+  function refreshStatus() {
+    if (!currentMission) return;
+    const cycle = getCycleLabel(currentMission, new Date());
+    updateStatusLine(`Cycle: ${cycle}`);
+  }
+
+  function downloadTxt() {
+    if (!currentMission) return;
+    const cycleLabel = getCycleLabel(currentMission, new Date());
+    const history = readHistory(currentMission.id, cycleLabel);
+    const lines = history.map(e => `${e.status.toUpperCase()}: ${toExportLine(e)}`).join('\n');
+    const blob = new Blob([lines], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${currentMission.id}_${cycleLabel}.txt`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function onRouteChange() {
+    currentMission = detectMission();
+    logDebug('Route change, mission =', currentMission && currentMission.id);
+    createDock();
+    refreshStatus();
+    loadInitialCount();
+  }
+
+  function installRouteHooksOnce() {
+    if (routeHooksInstalled) return;
+    routeHooksInstalled = true;
+
+    const _pushState = history.pushState;
+    history.pushState = function () {
+      const ret = _pushState.apply(this, arguments);
+      setTimeout(onRouteChange, 0);
+      return ret;
+    };
+
+    const _replaceState = history.replaceState;
+    history.replaceState = function () {
+      const ret = _replaceState.apply(this, arguments);
+      setTimeout(onRouteChange, 0);
+      return ret;
+    };
+
+    window.addEventListener('popstate', () => setTimeout(onRouteChange, 0));
+  }
+
+  function init() {
+    currentMission = detectMission();
+    logDebug('Init mission =', currentMission && currentMission.id);
+
+    installRouteHooksOnce();
+    // Network Interceptors
+    if (CONFIG.network.enable) installNetworkInterceptorsOnce();
+
+    if (!clickListenerInstalled) {
+      clickListenerInstalled = true;
+      document.addEventListener('click', handleClick, true);
+    }
+
+    if (currentMission) {
+      createDock();
+      refreshStatus();
+      loadInitialCount();
+    }
+  }
+
+  setTimeout(init, 1500);
+})();
